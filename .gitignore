@@ -1,0 +1,23 @@
+# Local secrets and runtime state
+.env
+**/.env
+!.env.example
+!**/.env.example
+
+# Python artifacts
+__pycache__/
+**/__pycache__/
+*.py[cod]
+
+# Virtual environments
+.venv/
+**/.venv/
+venv/
+**/venv/
+
+# Local database, logs, and generated data
+**/data/
+*.sqlite
+*.sqlite3
+*.db
+*.log

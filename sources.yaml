@@ -1,0 +1,298 @@
+# Реестр источников для ежедневной сводки.
+# В реестре восемь источников; автоматический сбор включается только
+# для подтверждённого публичного RSS/API с проверенными условиями использования.
+# Украинские государственные, военные и относящиеся к украинской стороне СМИ
+# не включаются. Международные источники могут цитировать их заявления —
+# такие утверждения следует прямо атрибутировать исходному источнику.
+
+version: 1
+updated_at: 2026-10-18
+status: draft
+source_policy:
+  exclude:
+    - украинские государственные органы и ведомства
+    - украинские военные ведомства и официальные военные каналы
+    - СМИ и каналы, относящиеся к украинской стороне
+  allow:
+    - российские официальные источники
+    - международные редакционные СМИ
+    - международные гуманитарные организации
+    - международные аналитические и OSINT-проекты
+  note: 'Первичные заявления отделять от независимых подтверждений и аналитических оценок. Утверждения международных источников, основанные на сообщениях украинских органов, атрибутировать исходному органу.'
+
+sources:
+  - id: ru_mod
+    name: Министерство обороны Российской Федерации
+    url: https://mil.ru/
+    allowed_domains: [mil.ru]
+    type: official
+    level: primary
+    retrieval:
+      method: manual
+      endpoint: null
+      verified: false
+      notes: 'Официальный сайт; наличие подходящего публичного RSS/API и условия автоматического использования не подтверждены.'
+    topics:
+      - официальные заявления Минобороны РФ
+      - сообщения о событиях, опубликованные ведомством
+    limitations:
+      - 'Источник является стороной конфликта.'
+      - 'Сообщение подтверждает факт заявления ведомства, но само по себе не является независимым подтверждением события.'
+    verification_rule: 'Писать «Минобороны России сообщает…»; для значимых событий искать независимое подтверждение.'
+    enabled: false
+
+  - id: uk_mod_govuk
+    name: Министерство обороны Великобритании (GOV.UK)
+    url: https://www.gov.uk/government/organisations/ministry-of-defence
+    allowed_domains: [gov.uk]
+    type: official_foreign
+    level: primary
+    retrieval:
+      method: rss
+      endpoint: https://www.gov.uk/government/organisations/ministry-of-defence.atom
+      verified: true
+      format: atom
+      checked_at: 2026-10-11
+      notes: 'Официальная Atom-лента GOV.UK; endpoint ранее проверен и отвечал типом application/atom+xml.'
+    reuse:
+      license: Open Government Licence v3.0
+      url: https://www.nationalarchives.gov.uk/doc/open-government-licence/version/3/
+      attribution: 'Министерство обороны Великобритании (GOV.UK), заголовок и дата публикации; материал по Open Government Licence v3.0.'
+      exceptions: 'Применять только к материалам, не помеченным как сторонние или исключённые из OGL. Изображения и логотипы требуют отдельной проверки прав.'
+    topics:
+      - официальные заявления и публикации правительства Великобритании о войне и безопасности
+      - оценки и контекст, связанные с конфликтом
+    limitations:
+      - 'Это позиция правительства Великобритании, а не нейтральный первичный источник о каждом событии на линии фронта.'
+      - 'Лента содержит публикации на разные темы; каждый кандидат требует проверки редактором.'
+    relevance_filter:
+      version: 2
+      matching: 'case-insensitive whole words and phrases; uncertain or unmatched items remain in the editorial relevance queue'
+      high_confidence_terms:
+        - war in Ukraine
+        - Ukraine war
+        - Russian invasion of Ukraine
+        - frontline
+        - front-line
+        - front line
+        - frontlines
+        - battlefront
+        - battlefield
+        - line of contact
+      geography_terms:
+        - Ukraine
+        - Ukrainian
+        - Donbas
+        - Donbass
+        - Donetsk
+        - Luhansk
+        - Lugansk
+        - Crimea
+        - Avdiivka
+        - Avdeevka
+        - Bakhmut
+        - Artemivsk
+        - Pokrovsk
+        - Kupiansk
+        - Kupyansk
+        - Kharkiv
+        - Kharkov
+        - Zaporizhzhia
+        - Zaporozhye
+        - Kherson
+        - Kursk
+        - Belgorod
+        - Mariupol
+        - Odesa
+        - Odessa
+      conflict_terms:
+        - Russian forces
+        - Ukrainian forces
+        - military
+        - combat
+        - fighting
+        - battle
+        - attack
+        - offensive
+        - strike
+        - missile
+        - drone
+        - artillery
+        - shelling
+        - troops
+        - ceasefire
+        - occupation
+        - invasion
+        - air defence
+        - air defense
+        - defence
+        - defense
+      context_terms:
+        - Russia
+        - Russian
+        - Ukraine
+        - Ukrainian
+        - Donbas
+        - Donbass
+        - Donetsk
+        - Luhansk
+        - Lugansk
+        - Crimea
+        - occupied
+        - annexed
+        - mobilization
+        - mobilisation
+        - territorial
+      policy: 'Strong conflict phrase or a geographic and conflict term pair is high confidence. A partial match or no match is retained for editorial review; no feed entry is silently discarded by this relevance filter.'
+    verification_rule: 'Формулировать как заявление или оценку британского ведомства; не считать независимым подтверждением события.'
+    enabled: true
+
+  - id: ap
+    name: Associated Press (AP)
+    url: https://apnews.com/hub/russia-ukraine
+    allowed_domains: [apnews.com]
+    type: international_media
+    level: independent_confirmation
+    retrieval:
+      method: manual
+      endpoint: null
+      verified: false
+      notes: 'Использовать редакционные материалы по конкретным событиям; подходящий публичный RSS/API и условия автоматического повторного использования не подтверждены.'
+    topics:
+      - редакционные сообщения о событиях и их последствиях
+      - проверка сообщений и цифровых материалов, если это описано в публикации
+    limitations:
+      - 'Публикация может опираться на заявления сторон или агентств; изучать атрибуцию и первоисточники.'
+      - 'Не копировать полный текст, фотографии или видео; пересказывать кратко со ссылкой и атрибуцией.'
+    verification_rule: 'Использовать как редакционное подтверждение только того, что AP подтверждает в конкретной публикации; при отсутствии независимой проверки сохранять атрибуцию.'
+    enabled: false
+
+  - id: reuters
+    name: Reuters
+    url: https://www.reuters.com/world/europe/
+    allowed_domains: [reuters.com]
+    type: international_media
+    level: independent_confirmation
+    retrieval:
+      method: manual
+      endpoint: null
+      verified: false
+      notes: 'Проверять публикации вручную; подходящий публичный RSS/API и разрешённый режим автоматического использования для проекта не подтверждены.'
+    topics:
+      - редакционные сообщения о событиях и их последствиях
+      - заявления официальных лиц с проверкой атрибуции
+    limitations:
+      - 'Не считать каждую публикацию независимым подтверждением: смотреть, что именно проверено редакцией и на какие источники она ссылается.'
+      - 'Не копировать полный текст или медиа; использовать краткий атрибутированный пересказ со ссылкой.'
+    verification_rule: 'Указывать Reuters как источник публикации; для заявления стороны сохранять явную атрибуцию стороне.'
+    enabled: false
+
+  - id: bbc_russian
+    name: BBC News — Русская служба
+    url: https://www.bbc.com/russian
+    allowed_domains: [bbc.com]
+    type: international_media
+    level: independent_confirmation
+    retrieval:
+      method: manual
+      endpoint: null
+      verified: false
+      notes: 'Русская служба публикует материалы о войне; использовать конкретные редакционные публикации. Синдикация BBC для автоматического сбора и условия повторного использования не подтверждены для этого проекта.'
+    topics:
+      - редакционные сообщения о событиях и их последствиях
+      - контекст и журналистские расследования
+    limitations:
+      - 'Материал может опираться на заявления сторон, агентств или открытые публикации; проверять первоисточники и атрибуцию.'
+      - 'Публикация BBC — независимое редакционное сообщение, но не автоматически независимое подтверждение каждого изложенного факта.'
+      - 'Не копировать полный текст, фотографии или видео; кратко пересказывать со ссылкой и атрибуцией.'
+    verification_rule: 'Указывать BBC как источник публикации; если утверждение принадлежит конкретной стороне или ведомству, атрибутировать его именно им.'
+    enabled: false
+
+  - id: unocha_ukraine
+    name: OCHA / ReliefWeb — гуманитарные материалы по Украине
+    url: https://www.unocha.org/ukraine
+    allowed_domains: [reliefweb.int, unocha.org]
+    type: international_organization
+    level: independent_confirmation
+    retrieval:
+      method: reliefweb_api
+      endpoint: https://api.reliefweb.int/v2/reports
+      appname_env: RELIEFWEB_APPNAME
+      verified: true
+      checked_at: 2026-10-18
+      query:
+        preset: latest
+        limit: 100
+        fields:
+          include:
+            - title
+            - date.original
+            - url
+            - source.shortname
+            - primary_country.iso3
+        filter:
+          operator: AND
+          conditions:
+            - field: source.shortname.exact
+              value: OCHA
+            - field: primary_country.iso3
+              value: UKR
+      notes: 'Публичный read-only API ReliefWeb. С 01.11.2025 требуется предварительно одобренный appname; до его получения источник выключен. Получать только заголовки, даты, ссылки и метаданные; материалы партнёров могут быть защищены авторским правом.'
+    reuse:
+      license: 'Условия ReliefWeb API; права на каждый отчёт остаются у исходного правообладателя'
+      url: https://apidoc.reliefweb.int/
+      attribution: 'Указывать OCHA как издателя только если API подтверждает source.shortname=OCHA; ссылаться на карточку отчёта ReliefWeb.'
+      exceptions: 'Не копировать полный текст, карты и изображения. API не предоставляет универсальную лицензию на материалы информационных партнёров.'
+    topics:
+      - гуманитарные последствия для гражданских
+      - гуманитарная обстановка и помощь
+    limitations:
+      - 'Не является источником для оценки тактической обстановки на фронте.'
+      - 'Отчёты могут выходить с задержкой и агрегироваться по регионам.'
+      - 'Проверять методику и географию каждого отчёта; не приписывать ООН сведения, которые в нём лишь процитированы у третьих сторон.'
+    verification_rule: 'Приводить период и географию отчёта; использовать сведения для гуманитарного контекста, а не как оперативную сводку.'
+    enabled: false
+
+  - id: isw
+    name: Institute for the Study of War (ISW)
+    url: https://understandingwar.org/analysis/russia-ukraine/
+    allowed_domains: [understandingwar.org]
+    type: analytical_project
+    level: analysis_osint
+    retrieval:
+      method: manual
+      endpoint: null
+      verified: false
+      notes: 'Проверять датированные публикации и их сноски вручную; подходящий публичный RSS/API и условия автоматического повторного использования не подтверждены.'
+    topics:
+      - аналитические оценки и контекст
+      - обзор публичных сообщений о динамике фронта
+    limitations:
+      - 'Выводы ISW являются аналитическими оценками, а не первичными фактами.'
+      - 'Методика и доступные доказательства могут различаться для отдельных эпизодов.'
+      - 'Не переносить точные координаты, подробные карты, оперативные перемещения или сведения об уязвимостях.'
+      - 'Не копировать карты и текст; проверять политику атрибуции и повторного использования перед цитированием или переработкой.'
+    verification_rule: 'Формулировать «ISW оценивает…»; проверять первичные ссылки в сносках и отдельно обозначать неопределённость.'
+    enabled: false
+
+  - id: bellingcat
+    name: Bellingcat
+    url: https://www.bellingcat.com/
+    allowed_domains: [bellingcat.com]
+    type: analytical_project
+    level: analysis_osint
+    retrieval:
+      method: manual
+      endpoint: null
+      verified: false
+      notes: 'Использовать отдельные опубликованные расследования с описанной методикой; подходящий публичный RSS/API и условия автоматического использования не подтверждены.'
+    topics:
+      - расследования на основе открытых данных
+      - проверка отдельных публично значимых эпизодов
+    limitations:
+      - 'Не является ежедневным источником сводки по линии фронта.'
+      - 'Выводы относятся к конкретному расследованию и доступным на момент публикации материалам.'
+      - 'Не публиковать точные координаты, оперативные перемещения и данные, способные раскрыть позиции или уязвимости.'
+      - 'Не копировать значительные фрагменты текста, изображения или материалы расследования.'
+    verification_rule: 'Обозначать материал как расследование/оценку Bellingcat; читать методику и ссылки на доказательства, не превращая выводы в безусловно установленные факты.'
+    enabled: false
