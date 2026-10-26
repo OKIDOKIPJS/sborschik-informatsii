@@ -414,7 +414,7 @@ def main(argv: list[str] | None = None) -> int:
                         published_at = datetime.fromisoformat(claim["published_at"])
                         expires_at = published_at + timedelta(hours=96)
                         print(f"  Публикация: {claim['published_at']} · актуально до "
-                              f"{expires_at.astimezone(timezone(timedelta(hours=3))).strftime('%d.%m.%Y %H:%M МСК')} · "
+                              f"{expires_at.astimezone(timezone(timedelta(hours=3))).strftime('%d.%m.%Y %H:%M')} МСК · "
                               f"{claim['source_name']} · {claim['source_url']}")
             elif args.review_command == "select-part":
                 select_batch_part(db, args.batch_id, args.draft_id)

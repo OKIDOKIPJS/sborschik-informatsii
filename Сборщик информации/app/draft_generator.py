@@ -139,7 +139,7 @@ def _event_groups_with_status(
 
 def _published_label(value: str) -> str:
     parsed = datetime.fromisoformat(value)
-    return parsed.astimezone(MOSCOW).strftime("%d.%m.%Y, %H:%M МСК")
+    return parsed.astimezone(MOSCOW).strftime("%d.%m.%Y, %H:%M") + " МСК"
 
 
 def _level(row: sqlite3.Row) -> str:
@@ -357,7 +357,8 @@ def create_daily_draft(db: sqlite3.Connection, hours: int = 24) -> int:
             )
         raise ValueError("Нет материалов с датой публикации в выбранном периоде")
     window_label = "24 часа" if hours == 24 else ("4 дня" if hours == 96 else f"{hours} ч")
-    title = f"Сводка за последние {window_label} — проверено {local_now.strftime('%d.%m.%Y в %H:%M МСК')}"
+    title = (f"Сводка за последние {window_label} — проверено "
+             f"{local_now.strftime('%d.%m.%Y')} в {local_now.strftime('%H:%M')} МСК")
     groups, grouping_warning = _event_groups_with_status(rows)
     older_cutoff = now - timedelta(hours=24)
     current_groups: list[list[sqlite3.Row]] = []

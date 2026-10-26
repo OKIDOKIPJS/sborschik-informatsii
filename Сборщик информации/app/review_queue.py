@@ -188,8 +188,8 @@ def defer_batch_part(db: sqlite3.Connection, batch_id: str, draft_id: int,
     if target_morning > expires_at.astimezone(MOSCOW):
         raise ValueError(
             f"Перенос выходит за срок актуальности: самый ранний материал опубликован "
-            f"{min(published).astimezone(MOSCOW).strftime('%d.%m.%Y %H:%M МСК')}; "
-            f"96 часов истекают {expires_at.astimezone(MOSCOW).strftime('%d.%m.%Y %H:%M МСК')}"
+            f"{min(published).astimezone(MOSCOW).strftime('%d.%m.%Y %H:%M')} МСК; "
+            f"96 часов истекают {expires_at.astimezone(MOSCOW).strftime('%d.%m.%Y %H:%M')} МСК"
         )
     now = now_iso()
     db.execute("UPDATE digest_batch_parts SET disposition='deferred',deferred_until=?,note=?,updated_at=? WHERE draft_id=?",
@@ -275,7 +275,7 @@ def review_source_revision(db: sqlite3.Connection, draft_id: int, claim_id: int,
             status, attribution = "ОЦЕНКА АНАЛИТИКА", f"{claim['source_name']} оценивает"
         else:
             status, attribution = "ЗАЯВЛЕНИЕ ИСТОЧНИКА", f"{claim['source_name']} сообщает"
-        published = datetime.fromisoformat(version["published_at"]).astimezone(MOSCOW).strftime("%d.%m.%Y, %H:%M МСК")
+        published = datetime.fromisoformat(version["published_at"]).astimezone(MOSCOW).strftime("%d.%m.%Y, %H:%M") + " МСК"
         replacement = [
             f"• **{status}** — {attribution}: {version['title'].rstrip('. ')}.",
         ]
