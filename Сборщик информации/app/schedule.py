@@ -6,18 +6,26 @@ import getpass
 import json
 import os
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
 APP_ROOT = Path(__file__).resolve().parents[1]
 TASKS = (
-    {"name": "Сборщик информации - Сбор 12-00", "hour": 12, "arguments": "-m app run --notify"},
-    {"name": "Сборщик информации - Публикация 14-00", "hour": 14, "arguments": "-m app publish-scheduled"},
+    {"name": "Сборщик информации - Сбор каждый час", "frequency": "hourly",
+     "interval_minutes": 60, "arguments": "-m app fetch"},
+    {"name": "Сборщик информации - Сбор 12-00", "frequency": "daily",
+     "hour": 12, "arguments": "-m app run --notify"},
 )
+# Retired because publishing is now handled through the MAX browser automation.
+RETIRED_TASKS = ("Сборщик информации - Публикация 14-00",)
 TASK_DESCRIPTION = "Managed by Сборщик информации. Do not edit manually."
 # Windows' stable time-zone identifier. Checking this identity also checks its
 # daylight-saving rules; a matching UTC offset alone does not.
 MOSCOW_WINDOWS_TIMEZONE = "Russian Standard Time"
+# StartWhenAvailable is honored for time-based triggers with an end boundary.
+# Far-future end boundary preserves the daily schedule for practical use.
+TRIGGER_END_BOUNDARY = "2099-12-31T23:59:59"
 
 
 def _ps_quote(value: str) -> str:
@@ -82,7 +90,7 @@ def _run_powershell(script: str, timeout: int = 30) -> str:
 
 
 def install_schedule(python_executable: str) -> list[dict[str, Any]]:
-    """Install/update the two app-owned interactive daily tasks."""
+    """Install/update the app-owned hourly collection and daily digest tasks."""
     _ensure_windows()
     _ensure_moscow_timezone()
     python_path = Path(python_executable).resolve()
@@ -94,8 +102,10 @@ def install_schedule(python_executable: str) -> list[dict[str, Any]]:
     user_id = f"{domain}\\{user_name}" if domain else user_name
 
     task_literals = ",\n    ".join(
-        "@{{ Name={}; Hour={}; Arguments={} }}".format(
-            _ps_quote(task["name"]), task["hour"], _ps_quote(task["arguments"])
+        "@{{ Name={}; Frequency={}; Hour={}; IntervalMinutes={}; Arguments={} }}".format(
+            _ps_quote(task["name"]), _ps_quote(task["frequency"]),
+            task.get("hour", 0), task.get("interval_minutes", 0),
+            _ps_quote(task["arguments"])
         ) for task in TASKS
     )
     script = f"""
@@ -105,6 +115,8 @@ $taskSpecs = @(
     {task_literals}
 )
 $taskDescription = {_ps_quote(TASK_DESCRIPTION)}
+$triggerEndBoundary = {_ps_quote(TRIGGER_END_BOUNDARY)}
+$retiredTaskNames = @({','.join(_ps_quote(name) for name in RETIRED_TASKS)})
 $pythonPath = {_ps_quote(str(python_path))}
 $workingDirectory = {_ps_quote(app_root)}
 $userId = {_ps_quote(user_id)}
@@ -114,13 +126,32 @@ foreach ($spec in $taskSpecs) {{
         throw "Задача '$($spec.Name)' уже существует и не принадлежит приложению; она не изменена."
     }}
 }}
+foreach ($name in $retiredTaskNames) {{
+    $existing = Get-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue
+    if (-not $existing) {{ continue }}
+    if ($existing.Description -ne $taskDescription) {{
+        throw "Задача '$name' не принадлежит приложению; она не изменена."
+    }}
+    Unregister-ScheduledTask -TaskName $name -Confirm:$false
+}}
 $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit (New-TimeSpan -Minutes 45) `
-    -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+    -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -WakeToRun -StartWhenAvailable
 $principal = New-ScheduledTaskPrincipal -UserId $userId -LogonType Interactive -RunLevel Limited
 foreach ($spec in $taskSpecs) {{
     $action = New-ScheduledTaskAction -Execute $pythonPath -Argument $spec.Arguments -WorkingDirectory $workingDirectory
-    $trigger = New-ScheduledTaskTrigger -Daily -At ([datetime]::Today.AddHours($spec.Hour))
-    Register-ScheduledTask -TaskName $spec.Name -Action $action -Trigger $trigger -Settings $settings `
+    if ($spec.Frequency -eq 'hourly') {{
+        # Windows rejects very long repetition durations in Task Scheduler XML.
+        # Use 24 daily triggers instead: one at each hour, recurring every day.
+        $triggers = @(
+            for ($hour = 0; $hour -lt 24; $hour++) {{
+                New-ScheduledTaskTrigger -Daily -At ([datetime]::Today.AddHours($hour))
+            }}
+        )
+    }} else {{
+        $triggers = @(New-ScheduledTaskTrigger -Daily -At ([datetime]::Today.AddHours($spec.Hour)))
+    }}
+    foreach ($trigger in $triggers) {{ $trigger.EndBoundary = $triggerEndBoundary }}
+    Register-ScheduledTask -TaskName $spec.Name -Action $action -Trigger $triggers -Settings $settings `
         -Principal $principal -Description $taskDescription -Force | Out-Null
 }}
 'Расписание установлено.'
@@ -131,26 +162,50 @@ foreach ($spec in $taskSpecs) {{
 
 def schedule_status() -> list[dict[str, Any]]:
     _ensure_windows()
-    names = ",".join(_ps_quote(task["name"]) for task in TASKS)
+    task_specs = ",\n    ".join(
+        "@{{ Name={}; Key={}; Arguments={}; ExpectedTriggers={} }}".format(
+            _ps_quote(task["name"]),
+            _ps_quote("hourly" if task["frequency"] == "hourly" else str(task["hour"])),
+            _ps_quote(task["arguments"]),
+            24 if task["frequency"] == "hourly" else 1,
+        )
+        for task in TASKS
+    )
     script = f"""
 $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
-$taskNames = @({names})
-$items = foreach ($name in $taskNames) {{
+$taskSpecs = @(
+    {task_specs}
+)
+$expectedPython = {_ps_quote(str(Path(sys.executable).resolve()))}
+$expectedWorkingDirectory = {_ps_quote(str(APP_ROOT.resolve()))}
+$expectedEndBoundary = {_ps_quote(TRIGGER_END_BOUNDARY)}
+$items = foreach ($spec in $taskSpecs) {{
+    $name = $spec.Name
     $task = Get-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue
     if (-not $task) {{
-        [pscustomobject]@{{ name=$name; registered=$false }}
+        [pscustomobject]@{{ key=$spec.Key; registered=$false }}
     }} else {{
         $info = Get-ScheduledTaskInfo -InputObject $task
         $action = $task.Actions | Select-Object -First 1
+        $triggers = @($task.Triggers)
+        $matches = ($action.Execute -ieq $expectedPython) -and `
+            ($action.Arguments -eq $spec.Arguments) -and `
+            ($action.WorkingDirectory -ieq $expectedWorkingDirectory) -and `
+            ([bool]$task.Settings.WakeToRun) -and `
+            ([bool]$task.Settings.StartWhenAvailable) -and `
+            ([string]$triggers[0].EndBoundary).StartsWith($expectedEndBoundary) -and `
+            ($triggers.Count -eq $spec.ExpectedTriggers)
         [pscustomobject]@{{
-            name=$name; registered=$true; state=[string]$task.State
+            key=$spec.Key; registered=$true; state=[string]$task.State
             nextRunTime=$info.NextRunTime.ToString('o')
             lastRunTime=$info.LastRunTime.ToString('o')
             lastTaskResult=$info.LastTaskResult
-            execute=$action.Execute; arguments=$action.Arguments
-            workingDirectory=$action.WorkingDirectory
-            description=$task.Description
+            wakeToRun=[bool]$task.Settings.WakeToRun
+            startWhenAvailable=[bool]$task.Settings.StartWhenAvailable
+            triggerEndBoundary=[string]$triggers[0].EndBoundary
+            triggerCount=$triggers.Count
+            actionMatches=[bool]$matches
         }}
     }}
 }}
@@ -169,7 +224,10 @@ ConvertTo-Json -InputObject @($items) -Compress -Depth 3
 def remove_schedule() -> list[str]:
     """Remove only tasks carrying this application's ownership description."""
     _ensure_windows()
-    task_names = ",".join(_ps_quote(task["name"]) for task in TASKS)
+    task_names = ",".join(
+        _ps_quote(name) for name in
+        [task["name"] for task in TASKS] + list(RETIRED_TASKS)
+    )
     script = f"""
 $ErrorActionPreference = 'Stop'
 $taskNames = @({task_names})

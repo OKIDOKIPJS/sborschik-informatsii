@@ -81,7 +81,16 @@ CREATE TABLE IF NOT EXISTS drafts (
     published_at TEXT,
     max_post_url TEXT,
     correction_of_id INTEGER REFERENCES drafts(id),
-    requires_group_review INTEGER NOT NULL DEFAULT 0
+    requires_group_review INTEGER NOT NULL DEFAULT 0,
+    correction_reason TEXT NOT NULL DEFAULT '',
+    correction_text TEXT NOT NULL DEFAULT '',
+    correction_source_id TEXT NOT NULL DEFAULT '',
+    correction_source_url TEXT NOT NULL DEFAULT '',
+    correction_original_url TEXT NOT NULL DEFAULT '',
+    correction_publication_check_status TEXT NOT NULL DEFAULT '',
+    correction_publication_checked_at TEXT,
+    correction_link_checked_at TEXT,
+    correction_link_check_note TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS digest_batches (
     id TEXT PRIMARY KEY,
@@ -132,6 +141,7 @@ CREATE TABLE IF NOT EXISTS draft_claims (
     publication_check_status TEXT NOT NULL DEFAULT '',
     publication_checked_at TEXT,
     link_checked_at TEXT,
+    link_check_note TEXT NOT NULL DEFAULT '',
     event_date TEXT,
     event_date_status TEXT NOT NULL DEFAULT 'unreviewed',
     event_date_note TEXT NOT NULL DEFAULT '',
@@ -263,6 +273,20 @@ def connect(path: Path | None = None) -> sqlite3.Connection:
             "UPDATE drafts SET requires_group_review=1 WHERE correction_of_id IS NULL "
             "AND body LIKE '%Объединение по локальной модели%'"
         )
+    correction_columns = {
+        "correction_reason": "ALTER TABLE drafts ADD COLUMN correction_reason TEXT NOT NULL DEFAULT ''",
+        "correction_text": "ALTER TABLE drafts ADD COLUMN correction_text TEXT NOT NULL DEFAULT ''",
+        "correction_source_id": "ALTER TABLE drafts ADD COLUMN correction_source_id TEXT NOT NULL DEFAULT ''",
+        "correction_source_url": "ALTER TABLE drafts ADD COLUMN correction_source_url TEXT NOT NULL DEFAULT ''",
+        "correction_original_url": "ALTER TABLE drafts ADD COLUMN correction_original_url TEXT NOT NULL DEFAULT ''",
+        "correction_publication_check_status": "ALTER TABLE drafts ADD COLUMN correction_publication_check_status TEXT NOT NULL DEFAULT ''",
+        "correction_publication_checked_at": "ALTER TABLE drafts ADD COLUMN correction_publication_checked_at TEXT",
+        "correction_link_checked_at": "ALTER TABLE drafts ADD COLUMN correction_link_checked_at TEXT",
+        "correction_link_check_note": "ALTER TABLE drafts ADD COLUMN correction_link_check_note TEXT NOT NULL DEFAULT ''",
+    }
+    for name, statement in correction_columns.items():
+        if name not in draft_columns:
+            connection.execute(statement)
     # Preserve reviewable evidence for drafts created before structured claims.
     # Legacy grouped drafts are conservatively migrated as one candidate group,
     # because their exact machine-generated cluster membership was not stored.
@@ -304,6 +328,7 @@ def connect(path: Path | None = None) -> sqlite3.Connection:
         "included": "ALTER TABLE draft_claims ADD COLUMN included INTEGER NOT NULL DEFAULT 1 CHECK(included IN (0,1))",
         "exclusion_reason": "ALTER TABLE draft_claims ADD COLUMN exclusion_reason TEXT NOT NULL DEFAULT ''",
         "excluded_at": "ALTER TABLE draft_claims ADD COLUMN excluded_at TEXT",
+        "link_check_note": "ALTER TABLE draft_claims ADD COLUMN link_check_note TEXT NOT NULL DEFAULT ''",
     }
     for name, statement in claim_migrations.items():
         if name not in claim_columns:

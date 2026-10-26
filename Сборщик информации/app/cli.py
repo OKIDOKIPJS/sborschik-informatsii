@@ -2,21 +2,26 @@
 from __future__ import annotations
 
 import argparse
+import getpass
 import json
 import sys
+import webbrowser
 from datetime import datetime, timedelta, timezone
 
 from .config import APP_DIR, get_source, load_sources, sources_path
-from .corrections import create_correction_draft
+from .credentials import get_max_credentials, remove_max_credentials, save_max_credentials
+from .corrections import create_correction_draft, mark_correction_evidence_checked
 from .db import connect
 from .draft_generator import create_daily_draft
 from .fetcher import fetch_enabled_sources, ingest_manual
 from .logs import recent_events, record_event
 from .publisher import publish as publish_draft, publish_scheduled, resolve_attempt
+from .publication_validator import validate_publication_url
 from .schedule import (MOSCOW_WINDOWS_TIMEZONE, install_schedule, local_timezone_id,
-                       notify_editor, remove_schedule, schedule_status)
+                       TRIGGER_END_BOUNDARY, notify_editor, remove_schedule, schedule_status)
 from .relevance import list_relevance, decide_relevance, relevance_report
-from .review_queue import (draft_claims, draft_groups, edit_draft, exclude_claim, get_draft,
+from .review_queue import (claim_link_check_is_current, draft_claims, draft_groups,
+                           edit_draft, exclude_claim, get_draft,
                            list_drafts, list_batches, batch_parts, select_batch_part,
                            close_batch_part, defer_batch_part, mark_claim_link_checked, review_candidate_group,
                            review_claim_event_date, revision_alerts, review_source_revision,
@@ -32,6 +37,11 @@ def build_parser() -> argparse.ArgumentParser:
     schedule_commands.add_parser("install", help="зарегистрировать сбор на 12:00 и публикацию на 14:00 МСК")
     schedule_commands.add_parser("status", help="показать состояние задач и время следующего запуска")
     schedule_commands.add_parser("remove", help="удалить зарегистрированные приложением задачи")
+    credentials = commands.add_parser("credentials", help="безопасная настройка учётных данных MAX")
+    credential_commands = credentials.add_subparsers(dest="credentials_command", required=True)
+    credential_commands.add_parser("status", help="показать, настроены ли учётные данные, не раскрывая их")
+    credential_commands.add_parser("set-max", help="ввести токен и ID канала в Диспетчер учётных данных Windows")
+    credential_commands.add_parser("remove-max", help="удалить сохранённые в Windows учётные данные MAX")
     commands.add_parser("fetch", help="получить новые материалы из включённых RSS/API-источников")
     run = commands.add_parser("run", help="собрать материалы и создать черновик без публикации")
     run.add_argument("--hours", type=int, default=24, help="окно публикаций, по умолчанию 24 часа; максимум 96")
@@ -98,8 +108,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     claim_check.add_argument("id", type=int, help="id черновика")
     claim_check.add_argument("claim_id", type=int, help="id утверждения из review show")
-    claim_check.add_argument("--checked", action="store_true", required=True,
-                             help="подтвердить, что открытая ссылка соответствует этому утверждению")
+    claim_check.add_argument("--note", required=True,
+                             help="кратко указать, что на странице подтверждает утверждение")
+    correction_check = review_commands.add_parser(
+        "correction-check", help="проверить ссылку и основание отдельного черновика исправления"
+    )
+    correction_check.add_argument("id", type=int, help="id черновика исправления")
+    correction_check.add_argument("--note", required=True, help="что именно перепроверено")
     event_date = review_commands.add_parser(
         "event-date", help="указать дату события или редакторски подтвердить её статус"
     )
@@ -145,6 +160,8 @@ def build_parser() -> argparse.ArgumentParser:
                              help="подтвердить проверку содержания и ссылок-оснований")
             sub.add_argument("--independence-checked", action="store_true", required=True,
                              help="подтвердить, что независимые подтверждения не пересказывают одно основание")
+            sub.add_argument("--groups-checked", action="store_true",
+                             help="подтвердить ручную проверку повторов, если модель группировки недоступна")
     publish = commands.add_parser("publish", help="опубликовать только одобренный черновик")
     publish.add_argument("id", type=int)
     publish.add_argument("--dry-run", action="store_true", help="показать текст без обращения к MAX")
@@ -168,6 +185,35 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def confirm_claim_link_review(url: str) -> str:
+    """Open the cited page and capture a short editor-entered evidence excerpt."""
+    print(f"Открываю ссылку утверждения в браузере: {url}")
+    try:
+        opened = webbrowser.open(url, new=2)
+    except Exception:
+        opened = False
+    if not opened:
+        print("Автоматически открыть браузер не удалось. Откройте ссылку вручную перед подтверждением.")
+    try:
+        confirmation = input("После чтения страницы и сверки с утверждением введите ПРОВЕРЕНО: ")
+    except EOFError as exc:
+        raise ValueError("Проверка требует интерактивного редакторского подтверждения в терминале") from exc
+    if confirmation.strip().casefold() != "проверено":
+        raise ValueError("Редакторская проверка не подтверждена; отметка не сохранена")
+    try:
+        evidence = input(
+            "Кратко укажите фрагмент или содержание страницы, которое поддерживает утверждение "
+            "(не более 500 символов): "
+        ).strip()
+    except EOFError as exc:
+        raise ValueError("Нужно сохранить краткое основание проверки") from exc
+    if len(evidence) < 8:
+        raise ValueError("Основание слишком короткое; отметка не сохранена")
+    if len(evidence) > 500:
+        raise ValueError("Основание ограничено 500 символами; отметка не сохранена")
+    return evidence
+
+
 def _draft_batch_ids(db, first_id: int) -> list[int]:
     event = db.execute(
         """SELECT details FROM events WHERE kind='draft_created' AND entity_type='draft'
@@ -187,7 +233,7 @@ def main(argv: list[str] | None = None) -> int:
     db = None
     try:
         config = None
-        if args.command != "schedule":
+        if args.command not in {"schedule", "credentials"}:
             config = load_sources()
             db = connect()
         if args.command == "schedule":
@@ -195,7 +241,11 @@ def main(argv: list[str] | None = None) -> int:
                 tasks = install_schedule(sys.executable)
                 print(f"Расписание установлено с Python: {sys.executable}")
                 for task in tasks:
-                    print(f"{task['name']}: зарегистрирована; следующий запуск {task.get('nextRunTime', 'не определён')}")
+                    task_name = {
+                        "hourly": "Сборщик информации - Сбор каждый час",
+                        "12": "Сборщик информации - Сбор 12-00",
+                    }.get(str(task.get("key")), "Задача Планировщика")
+                    print(f"{task_name}: зарегистрирована; следующий запуск {task.get('nextRunTime', 'не определён')}")
                 print("Задачи работают только при входе этого пользователя Windows в систему; токен MAX должен быть задан для него.")
             elif args.schedule_command == "status":
                 tasks = schedule_status()
@@ -210,25 +260,41 @@ def main(argv: list[str] | None = None) -> int:
                 else:
                     print("Часовой пояс Windows: Москва (Russian Standard Time).")
                 for task in tasks:
+                    task_name = {
+                        "hourly": "Сборщик информации - Сбор каждый час",
+                        "12": "Сборщик информации - Сбор 12-00",
+                    }.get(str(task.get("key")), "Задача Планировщика")
                     if not task.get("registered"):
-                        print(f"{task['name']}: НЕ УСТАНОВЛЕНА")
+                        print(f"{task_name}: НЕ УСТАНОВЛЕНА")
                         continue
-                    expected_arguments = (
-                        "-m app run --notify" if task["name"].endswith("Сбор 12-00")
-                        else "-m app publish-scheduled"
-                    )
-                    action_matches = (
-                        str(task.get("execute", "")).casefold() == str(sys.executable).casefold()
-                        and str(task.get("arguments", "")).strip() == expected_arguments
-                        and str(task.get("workingDirectory", "")).casefold() == str(APP_DIR).casefold()
-                    )
                     next_run = task.get("nextRunTime") or "не назначен"
-                    print(f"{task['name']}: {task.get('state', 'неизвестно')}; следующий запуск {next_run}; "
+                    cadence = "каждый час" if task.get("key") == "hourly" else "ежедневно"
+                    print(f"{task_name}: {task.get('state', 'неизвестно')}; следующий запуск {next_run}; "
+                          f"периодичность {cadence}; "
                           f"последний код {task.get('lastTaskResult', '—')}; "
-                          f"настройки {'совпадают' if action_matches else 'нужно переустановить'}")
+                          f"пробуждение {'включено' if task.get('wakeToRun') else 'выключено'}; "
+                          f"запуск после пропуска {'включён' if task.get('startWhenAvailable') else 'выключен'}; "
+                          f"настройки {'совпадают' if task.get('actionMatches') is True else 'нужно переустановить'}")
             else:
                 removed = remove_schedule()
                 print("Удалены задачи: " + (", ".join(removed) if removed else "зарегистрированных задач не было"))
+        elif args.command == "credentials":
+            if args.credentials_command == "status":
+                token, channel_id = get_max_credentials()
+                print(f"MAX bot token: {'настроен' if token else 'НЕ НАСТРОЕН'}")
+                print(f"MAX channel ID: {'настроен' if channel_id else 'НЕ НАСТРОЕН'}")
+                print("Значения не показываются.")
+            elif args.credentials_command == "set-max":
+                channel_id = input("ID или адрес канала MAX: ").strip()
+                token = getpass.getpass("Токен бота MAX (ввод скрыт): ")
+                confirmation = getpass.getpass("Повторите токен для проверки (ввод скрыт): ")
+                if token != confirmation:
+                    raise ValueError("Токены не совпадают; сохранение отменено")
+                save_max_credentials(token, channel_id)
+                print("Учётные данные MAX сохранены в Диспетчере учётных данных Windows для текущего пользователя.")
+            else:
+                removed = remove_max_credentials()
+                print("Учётные данные MAX удалены." if removed else "Сохранённых учётных данных MAX не найдено.")
         elif args.command == "init":
             print(f"База создана/готова. Источники: {sources_path()}")
         elif args.command == "fetch":
@@ -317,6 +383,8 @@ def main(argv: list[str] | None = None) -> int:
                           f"{row['published_at'] or 'дата не указана'} · {row['title']}")
                     print(f"  {row['reason']}; термины: {terms}")
                     print(f"  {row['url']}")
+                    if row["confidence"] == "low" and not row["reviewed_at"]:
+                        print("  Автоматически исключено фильтром; для аудита используйте review relevance --status excluded")
                     if row["editor_note"]:
                         print(f"  Решение редактора: {row['editor_note']}")
             elif args.review_command == "relevance-check":
@@ -337,13 +405,17 @@ def main(argv: list[str] | None = None) -> int:
                 claims = draft_claims(db, args.id)
                 print("\nСТРУКТУРИРОВАННЫЕ УТВЕРЖДЕНИЯ И СВЯЗИ С ИСТОЧНИКАМИ")
                 for claim in claims:
-                    checked = "проверено редактором" if claim["link_checked_at"] else "НЕ ПРОВЕРЕНО"
+                    checked = "проверка актуальна" if claim_link_check_is_current(claim) else "НЕ ПРОВЕРЕНО / УСТАРЕЛО"
                     included = "включено" if claim["included"] else f"ИСКЛЮЧЕНО: {claim['exclusion_reason']}"
                     print(f"\nУтверждение #{claim['id']} · группа-кандидат #{claim['group_no']} · {included} · {checked}")
                     print(f"  Текст: {claim['claim_text']}\n  Источник: {claim['source_name']} ({claim['source_id']})")
                     if claim["version_no"] is not None:
                         print(f"  Версия материала: v{claim['version_no']}")
                     print(f"  Опубликовано: {claim['published_at']}\n  Ссылка: {claim['source_url']}")
+                    print(f"  Текущая HTTP-проверка: {claim['publication_check_status'] or 'нет'} "
+                          f"({claim['publication_checked_at'] or 'время не записано'})")
+                    if claim["link_check_note"]:
+                        print(f"  Пояснение проверки редактора: {claim['link_check_note']}")
                     if claim["same_url_other_source"]:
                         print("  Повторная ссылка: та же страница поступила через другой источник; "
                               "не считать независимым подтверждением.")
@@ -375,8 +447,34 @@ def main(argv: list[str] | None = None) -> int:
                 review_source_revision(db, args.id, args.claim_id, mode, args.note)
                 print(f"Проверка новой версии для утверждения #{args.claim_id} в черновике #{args.id} сохранена.")
             elif args.review_command == "claim-check":
-                mark_claim_link_checked(db, args.id, args.claim_id)
-                print(f"Ссылка утверждения #{args.claim_id} в черновике #{args.id} отмечена проверенной.")
+                claim = db.execute(
+                    "SELECT source_id,source_url FROM draft_claims WHERE id=? AND draft_id=? AND included=1",
+                    (args.claim_id, args.id),
+                ).fetchone()
+                if claim is None:
+                    raise ValueError(f"Активное утверждение #{args.claim_id} не найдено в черновике #{args.id}")
+                source = get_source(load_sources(), claim["source_id"])
+                validate_publication_url(source, claim["source_url"])
+                evidence = confirm_claim_link_review(claim["source_url"])
+                editor_note = f"{args.note.strip()} Основание редактора: {evidence}"
+                result = mark_claim_link_checked(db, args.id, args.claim_id, True, editor_note)
+                http_status = result.get("http_status", "не получен")
+                print(f"Ссылка утверждения #{args.claim_id} перепроверена: {result['status']} "
+                      f"(HTTP {http_status}). Сохранено пояснение редактора; HTTP-проверка не подтверждает истинность факта.")
+            elif args.review_command == "correction-check":
+                correction = db.execute(
+                    "SELECT correction_source_id,correction_source_url FROM drafts WHERE id=? AND correction_of_id IS NOT NULL",
+                    (args.id,),
+                ).fetchone()
+                if correction is None:
+                    raise ValueError(f"Черновик #{args.id} не является исправлением")
+                source = get_source(load_sources(), correction["correction_source_id"])
+                validate_publication_url(source, correction["correction_source_url"])
+                evidence = confirm_claim_link_review(correction["correction_source_url"])
+                result = mark_correction_evidence_checked(db, args.id, args.note, evidence)
+                http_status = result.get("http_status", "не получен")
+                print(f"Основание исправления перепроверено ({result['status']}, HTTP {http_status}); "
+                      "решение сохранено. HTTP-проверка не доказывает истинность основания.")
             elif args.review_command == "event-date":
                 mode = "explicit" if args.event_date else ("same_day" if args.same_day else "unknown")
                 review_claim_event_date(db, args.id, args.claim_id, mode, args.event_date, args.note)
@@ -397,6 +495,7 @@ def main(argv: list[str] | None = None) -> int:
                     checks = {
                         "evidence_checked": args.evidence_checked,
                         "independence_checked": args.independence_checked,
+                        "groups_checked": args.groups_checked,
                     }
                 set_decision(db, args.id, decision, checks)
                 print(f"Черновик #{args.id}: {decision}")

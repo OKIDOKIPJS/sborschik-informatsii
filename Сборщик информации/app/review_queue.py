@@ -6,9 +6,14 @@ import sqlite3
 from datetime import date, datetime, time, timedelta, timezone
 from urllib.parse import urlsplit
 
+from .config import get_source, load_sources
+from .corrections import correction_evidence_is_current
+from .draft_generator import _source_summary_excerpt
 from .logs import now_iso, record_event
+from .publication_validator import check_publication_link
 
 MOSCOW = timezone(timedelta(hours=3))
+LINK_REVIEW_TTL = timedelta(hours=24)
 
 
 def list_drafts(db: sqlite3.Connection, status: str | None = None) -> list[sqlite3.Row]:
@@ -197,9 +202,14 @@ def review_source_revision(db: sqlite3.Connection, draft_id: int, claim_id: int,
         published = datetime.fromisoformat(version["published_at"]).astimezone(MOSCOW).strftime("%d.%m.%Y, %H:%M МСК")
         replacement = [
             f"• **{status}** — {attribution}: {version['title'].rstrip('. ')}.",
+        ]
+        summary_excerpt = _source_summary_excerpt(version)
+        if summary_excerpt:
+            replacement.append(f"— Выжимка из описания {claim['source_name']} (до двух предложений): {summary_excerpt}")
+        replacement.extend([
             "— Дата события не проверена редактором; требуется уточнить до одобрения.",
             f"— {claim['source_name']}, опубликовано {published}; {validation}: {version['url']}",
-        ]
+        ])
         lines, statement_index, evidence_index = _claim_block(draft["body"], claim)
         lines[statement_index:evidence_index + 1] = replacement
         updated_body = "\n".join(lines)
@@ -207,7 +217,7 @@ def review_source_revision(db: sqlite3.Connection, draft_id: int, claim_id: int,
             raise ValueError("После обновления утверждения черновик превышает лимит MAX; сократите текст вручную")
         db.execute(
             """UPDATE draft_claims SET version_id=?,claim_text=?,published_at=?,source_url=?,
-               publication_check_status=?,publication_checked_at=?,link_checked_at=NULL,
+               publication_check_status=?,publication_checked_at=?,link_checked_at=NULL,link_check_note='',
                event_date=NULL,event_date_status='unreviewed',event_date_note='',event_date_reviewed_at=NULL
                WHERE id=?""",
             (version["id"], version["title"].rstrip(". "), version["published_at"], version["url"],
@@ -240,15 +250,45 @@ def draft_groups(db: sqlite3.Connection, draft_id: int) -> list[sqlite3.Row]:
     ))
 
 
+def _claim_statement_index(lines: list[str], claim_text: str, evidence_index: int) -> int | None:
+    # Prefer the actual post bullet: a source-provided synopsis may repeat the
+    # headline and must not become the start of the claim block for edits.
+    statement_index = next((index for index in range(evidence_index, -1, -1)
+                            if lines[index].startswith("•") and claim_text in lines[index]), None)
+    if statement_index is not None:
+        return statement_index
+    # Backward compatibility for older drafts whose claim and URL share a line.
+    return next((index for index in range(evidence_index, -1, -1)
+                 if claim_text in lines[index]), None)
+
+
 def _claim_block(body: str, claim: sqlite3.Row) -> tuple[list[str], int, int]:
     """Return body lines and the claim's statement/evidence line positions."""
     lines = body.splitlines()
+    # Prefer a source-specific bullet and find its citation before the next
+    # bullet. This is important when different publishers point to the same
+    # canonical URL: a global first-match search would bind both claims to one
+    # publisher's statement.
+    bullet_positions = [index for index, line in enumerate(lines) if line.startswith("•")]
+    for position, statement_index in enumerate(bullet_positions):
+        line = lines[statement_index]
+        if claim["claim_text"] not in line or claim["source_name"] not in line:
+            continue
+        block_end = bullet_positions[position + 1] if position + 1 < len(bullet_positions) else len(lines)
+        evidence_index = next(
+            (index for index in range(statement_index, block_end) if claim["source_url"] in lines[index]),
+            None,
+        )
+        if evidence_index is not None:
+            return lines, statement_index, evidence_index
+
+    # Backward compatibility for older drafts whose source attribution or
+    # citation layout differs from the current claim-block template.
     evidence_index = next((index for index, line in enumerate(lines)
                            if claim["source_url"] in line), None)
     if evidence_index is None:
         raise ValueError(f"Утверждение #{claim['id']}: его ссылка отсутствует в тексте черновика")
-    statement_index = next((index for index in range(evidence_index, -1, -1)
-                            if claim["claim_text"] in lines[index]), None)
+    statement_index = _claim_statement_index(lines, claim["claim_text"], evidence_index)
     if statement_index is None:
         raise ValueError(f"Утверждение #{claim['id']}: его формулировка отсутствует в тексте черновика")
     return lines, statement_index, evidence_index
@@ -307,8 +347,9 @@ def review_claim_event_date(db: sqlite3.Connection, draft_id: int, claim_id: int
         while statement_index + 1 < len(lines) and lines[statement_index + 1].startswith("— Дата события"):
             del lines[statement_index + 1]
     new_evidence_index = next(index for index, line in enumerate(lines) if claim["source_url"] in line)
-    new_statement_index = next(index for index in range(new_evidence_index, -1, -1)
-                               if claim["claim_text"] in lines[index])
+    new_statement_index = _claim_statement_index(lines, claim["claim_text"], new_evidence_index)
+    if new_statement_index is None:
+        raise ValueError(f"Утверждение #{claim_id}: его формулировка отсутствует в тексте черновика")
     lines.insert(new_statement_index + 1, _event_date_line(status, resolved_date, claim["published_at"]))
     updated_body = "\n".join(lines)
     if len(updated_body) > 4000:
@@ -365,7 +406,31 @@ def exclude_claim(db: sqlite3.Connection, draft_id: int, claim_id: int, reason: 
                  {"draft_id": draft_id, "reason": reason.strip()})
 
 
-def mark_claim_link_checked(db: sqlite3.Connection, draft_id: int, claim_id: int) -> None:
+def claim_link_check_is_current(claim: sqlite3.Row, now: datetime | None = None) -> bool:
+    if claim["publication_check_status"] not in {"http_ok", "manual_check_required"}:
+        return False
+    if not claim["link_check_note"].strip():
+        return False
+    current = now or datetime.now(timezone.utc)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+    for value in (claim["link_checked_at"], claim["publication_checked_at"]):
+        if not value:
+            return False
+        try:
+            checked_at = datetime.fromisoformat(value)
+        except (TypeError, ValueError):
+            return False
+        if checked_at.tzinfo is None:
+            checked_at = checked_at.replace(tzinfo=timezone.utc)
+        age = current.astimezone(timezone.utc) - checked_at.astimezone(timezone.utc)
+        if age < timedelta(0) or age > LINK_REVIEW_TTL:
+            return False
+    return True
+
+
+def mark_claim_link_checked(db: sqlite3.Connection, draft_id: int, claim_id: int,
+                            checked: bool, note: str) -> dict[str, str]:
     draft = get_draft(db, draft_id)
     if draft["status"] != "pending":
         raise ValueError("Проверять утверждения можно только в pending-черновике")
@@ -374,14 +439,40 @@ def mark_claim_link_checked(db: sqlite3.Connection, draft_id: int, claim_id: int
     ).fetchone()
     if claim is None:
         raise ValueError(f"Утверждение #{claim_id} не относится к черновику #{draft_id}")
+    if not checked:
+        raise ValueError("Подтвердите, что вы открыли ссылку и сверили её с утверждением")
+    if not note.strip():
+        raise ValueError("Добавьте краткое пояснение: что именно на странице подтверждает утверждение")
     parts = urlsplit(claim["source_url"])
     if parts.scheme not in {"http", "https"} or not parts.netloc:
         raise ValueError(f"У утверждения #{claim_id} нет действительной HTTP(S)-ссылки")
+    try:
+        source = get_source(load_sources(), claim["source_id"])
+        publication_check = check_publication_link(source, claim["source_url"], origin="manual")
+    except Exception as exc:
+        # A failed recheck must invalidate any earlier attestation immediately.
+        db.execute(
+            """UPDATE draft_claims SET link_checked_at=NULL,link_check_note='',
+               publication_check_status='',publication_checked_at=NULL WHERE id=?""",
+            (claim_id,),
+        )
+        db.commit()
+        record_event(db, "claim_link_check_failed", "draft_claim", claim_id,
+                     {"draft_id": draft_id, "source_url": claim["source_url"],
+                      "error": f"{type(exc).__name__}: {exc}"})
+        raise
     checked_at = now_iso()
-    db.execute("UPDATE draft_claims SET link_checked_at=? WHERE id=?", (checked_at, claim_id))
+    db.execute(
+        """UPDATE draft_claims SET link_checked_at=?,link_check_note=?,
+           publication_check_status=?,publication_checked_at=? WHERE id=?""",
+        (checked_at, note.strip(), publication_check["status"],
+         publication_check["checked_at"], claim_id),
+    )
     db.commit()
     record_event(db, "claim_link_checked", "draft_claim", claim_id,
-                 {"draft_id": draft_id, "source_url": claim["source_url"]})
+                 {"draft_id": draft_id, "source_url": claim["source_url"],
+                  "editor_note": note.strip(), "publication_check": publication_check})
+    return publication_check
 
 
 def review_candidate_group(db: sqlite3.Connection, draft_id: int, group_no: int,
@@ -406,6 +497,14 @@ def review_candidate_group(db: sqlite3.Connection, draft_id: int, group_no: int,
             "В группе есть одинаковая ссылка у разных источников. Эти записи не являются независимыми; "
             "зафиксируйте --not-independent."
         )
+    if independent and db.execute(
+        """SELECT 1 FROM draft_claims WHERE group_id=? AND included=1
+           GROUP BY source_id HAVING COUNT(*)>1 LIMIT 1""", (group["id"],)
+    ).fetchone():
+        raise ValueError(
+            "В группе несколько материалов одного издателя. Они не являются независимыми источниками; "
+            "зафиксируйте --not-independent."
+        )
     reviewed_at = now_iso()
     db.execute(
         """UPDATE draft_groups SET review_same_event=?,sources_independent=?,review_note=?,reviewed_at=?
@@ -426,6 +525,23 @@ def edit_draft(db: sqlite3.Connection, draft_id: int, text: str) -> None:
     if len(text) > 4000:
         raise ValueError("MAX ограничивает текст поста 4000 символами")
     db.execute("UPDATE drafts SET body=?,updated_at=? WHERE id=?", (text, now_iso(), draft_id))
+    # Any prose edit can alter the relationship between evidence and wording.
+    # Force a fresh link review, event-date review, and candidate-group review.
+    db.execute(
+        """UPDATE draft_claims SET link_checked_at=NULL,link_check_note='',
+           event_date_status='unreviewed',event_date=NULL,event_date_note='',event_date_reviewed_at=NULL
+           WHERE draft_id=? AND included=1""", (draft_id,)
+    )
+    db.execute(
+        """UPDATE draft_groups SET review_same_event=NULL,sources_independent=NULL,
+           review_note='',reviewed_at=NULL WHERE draft_id=?""", (draft_id,)
+    )
+    if draft["correction_of_id"] is not None:
+        db.execute(
+            """UPDATE drafts SET correction_publication_check_status='',
+               correction_publication_checked_at=NULL,correction_link_checked_at=NULL,
+               correction_link_check_note='' WHERE id=?""", (draft_id,)
+        )
     db.commit()
     record_event(db, "draft_corrected", "draft", draft_id,
                  {"previous_text": draft["body"], "corrected_text": text})
@@ -445,8 +561,27 @@ def set_decision(db: sqlite3.Connection, draft_id: int, decision: str,
         if not checks.get("independence_checked"):
             raise ValueError("Перед одобрением подтвердите проверку независимости оснований: --independence-checked")
     if decision == "approved" and draft["correction_of_id"]:
-        if "ИСПРАВЛЕНИЕ" not in draft["body"] or "Исходная публикация:" not in draft["body"] or "Основание исправления: http" not in draft["body"]:
-            raise ValueError("Черновик исправления должен явно ссылаться на исходный пост и основание исправления")
+        original = db.execute(
+            "SELECT status,max_post_url FROM drafts WHERE id=?", (draft["correction_of_id"],)
+        ).fetchone()
+        if original is None or original["status"] != "published" or not original["max_post_url"]:
+            raise ValueError("Исходный пост исправления должен оставаться опубликованным и иметь ссылку MAX")
+        if ("ИСПРАВЛЕНИЕ" not in draft["body"]
+                or not draft["correction_reason"] or draft["correction_reason"] not in draft["body"]
+                or not draft["correction_text"] or draft["correction_text"] not in draft["body"]
+                or not draft["correction_source_id"] or not draft["correction_source_url"]
+                or draft["correction_source_url"] not in draft["body"]
+                or draft["correction_original_url"] != original["max_post_url"]
+                or draft["correction_original_url"] not in draft["body"]):
+            raise ValueError(
+                "В черновике исправления должны совпадать сохранённые ошибочная и исправленная формулировки, "
+                "разрешённое основание и ссылка на исходный пост"
+            )
+        if not correction_evidence_is_current(draft):
+            raise ValueError(
+                "Перед одобрением исправления выполните review correction-check ID --note, "
+                "откройте ссылку и сохраните короткое основание проверки; отметка действует 24 часа."
+            )
     if decision == "approved" and not draft["correction_of_id"]:
         unresolved_revisions = db.execute(
             "SELECT COUNT(*) FROM revision_alerts WHERE draft_id=? AND resolution IS NULL",
@@ -466,8 +601,12 @@ def set_decision(db: sqlite3.Connection, draft_id: int, decision: str,
             parts = urlsplit(claim["source_url"])
             if parts.scheme not in {"http", "https"} or not parts.netloc:
                 raise ValueError(f"Утверждение #{claim['id']}: ссылка должна быть действительной HTTP(S)-ссылкой")
-            if not claim["link_checked_at"]:
-                raise ValueError(f"Утверждение #{claim['id']}: откройте его ссылку и отметьте связь с утверждением командой review claim-check")
+            if not claim_link_check_is_current(claim):
+                raise ValueError(
+                    f"Утверждение #{claim['id']}: повторно откройте ссылку, проверьте её доступность "
+                    "и соответствие утверждению, затем выполните интерактивную команду review claim-check --note. "
+                    "Проверка ссылки действует 24 часа."
+                )
             if claim["claim_text"] not in draft["body"] or claim["source_url"] not in draft["body"]:
                 raise ValueError(f"Утверждение #{claim['id']}: сохраните его формулировку и собственную ссылку в тексте черновика")
             if (claim["event_date_status"] not in {"explicit", "same_day"}
@@ -479,35 +618,81 @@ def set_decision(db: sqlite3.Connection, draft_id: int, decision: str,
             expected_date_line = _event_date_line(
                 claim["event_date_status"], claim["event_date"], claim["published_at"]
             )
-            claim_lines, _, evidence_index = _claim_block(draft["body"], claim)
-            statement_index = next(index for index in range(evidence_index, -1, -1)
-                                   if claim["claim_text"] in claim_lines[index])
+            claim_lines, statement_index, evidence_index = _claim_block(draft["body"], claim)
             if expected_date_line not in claim_lines[statement_index:evidence_index + 1]:
                 # Legacy grouped rows can put the claim and evidence URL on one line.
                 if not (statement_index == evidence_index and evidence_index + 1 < len(claim_lines)
                         and claim_lines[evidence_index + 1] == expected_date_line):
                     raise ValueError(f"Утверждение #{claim['id']}: дата события должна быть указана рядом с ним в тексте")
 
-        for group in draft_groups(db, draft_id):
-            if int(group["claim_count"]) > 1 and (
-                group["review_same_event"] is None or group["sources_independent"] is None
-                or not group["reviewed_at"] or not group["review_note"].strip()
-            ):
+        candidate_groups = [group for group in draft_groups(db, draft_id) if int(group["claim_count"]) > 1]
+        for group in candidate_groups:
+            if (group["review_same_event"] is None or group["sources_independent"] is None
+                    or not group["reviewed_at"] or not group["review_note"].strip()):
                 raise ValueError(
                     f"Группа-кандидат #{group['group_no']}: отдельно зафиксируйте, одно ли это событие "
                     "и независимы ли источники командой review group-check"
                 )
-        checks["groups_checked"] = True
+        if draft["requires_group_review"] and not candidate_groups:
+            if not checks.get("groups_checked"):
+                raise ValueError(
+                    "Автоматическая группировка недоступна или не выполнена. Проверьте вручную возможные "
+                    "повторы и подтвердите это флагом --groups-checked."
+                )
+        else:
+            checks["groups_checked"] = True
 
         lines = draft["body"].splitlines()
         bullet_positions = [index for index, line in enumerate(lines) if line.startswith("•")]
         if not bullet_positions:
             raise ValueError("В черновике нет пунктов со статусами; исправьте структуру перед одобрением")
-        allowed = ("ПОДТВЕРЖДЕНО", "ЗАЯВЛЕНИЕ ИСТОЧНИКА", "ОЦЕНКА АНАЛИТИКА")
-        for number, position in enumerate(bullet_positions, start=1):
-            bullet = lines[position]
-            if not any(label in bullet.upper() for label in allowed):
-                raise ValueError(f"Пункт {number}: укажите статус «подтверждено», «заявление источника» или «оценка аналитика»")
+        if len(bullet_positions) != len(claims):
+            raise ValueError(
+                "Число пунктов в тексте не совпадает с числом включённых утверждений; "
+                "удалите неподкреплённые пункты или восстановите потерянные утверждения."
+            )
+        group_by_id = {int(group["id"]): group for group in draft_groups(db, draft_id)}
+        seen_statements: set[int] = set()
+        for claim in claims:
+            claim_lines, statement_index, _evidence_index = _claim_block(draft["body"], claim)
+            if statement_index in seen_statements:
+                raise ValueError("Несколько утверждений связаны с одним пунктом текста; разделите их перед одобрением")
+            seen_statements.add(statement_index)
+            bullet = claim_lines[statement_index].upper()
+            is_confirmed = "ПОДТВЕРЖДЕНО" in bullet
+            is_source_statement = "ЗАЯВЛЕНИЕ ИСТОЧНИКА" in bullet
+            is_analyst_assessment = "ОЦЕНКА АНАЛИТИКА" in bullet
+            if sum((is_confirmed, is_source_statement, is_analyst_assessment)) != 1:
+                raise ValueError(
+                    f"Утверждение #{claim['id']}: укажите ровно один статус — подтверждённое, "
+                    "заявление источника или оценка аналитика."
+                )
+            if claim["source_level"] == "analysis_osint":
+                if not is_analyst_assessment:
+                    raise ValueError(
+                        f"Утверждение #{claim['id']}: аналитический материал должен быть обозначен как оценка аналитика."
+                    )
+            elif is_analyst_assessment:
+                raise ValueError(
+                    f"Утверждение #{claim['id']}: статус «оценка аналитика» не соответствует уровню источника."
+                )
+            if is_confirmed:
+                group = group_by_id.get(int(claim["group_id"]))
+                independent_sources = db.execute(
+                    """SELECT COUNT(DISTINCT source_id) AS source_count,
+                              SUM(CASE WHEN same_url_other_source=1 THEN 1 ELSE 0 END) AS repeated_urls,
+                              SUM(CASE WHEN source_level='analysis_osint' THEN 1 ELSE 0 END) AS analyses
+                       FROM draft_claims WHERE group_id=? AND included=1""", (claim["group_id"],)
+                ).fetchone()
+                if (group is None or group["review_same_event"] != 1 or group["sources_independent"] != 1
+                        or int(group["claim_count"]) < 2
+                        or int(independent_sources["source_count"] or 0) < 2
+                        or int(independent_sources["repeated_urls"] or 0) > 0
+                        or int(independent_sources["analyses"] or 0) > 0):
+                    raise ValueError(
+                        f"Утверждение #{claim['id']}: статус «подтверждено» допустим только при нескольких "
+                        "разных, независимо проверенных неаналитических источниках об одном событии."
+                    )
     db.execute("UPDATE drafts SET status=?,updated_at=? WHERE id=?", (decision, now_iso(), draft_id))
     db.commit()
     record_event(db, f"draft_{decision}", "draft", draft_id,

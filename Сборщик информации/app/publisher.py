@@ -8,13 +8,46 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import date, datetime, time, timedelta, timezone
+from urllib.parse import urlsplit
 
+from .credentials import get_max_credentials
 from .logs import now_iso, record_event
-from .review_queue import get_draft
+from .review_queue import claim_link_check_is_current, get_draft
 
 API_URL = "https://platform-api2.max.ru/messages"
 MOSCOW = timezone(timedelta(hours=3))
 PUBLISH_AT = time(14, 0)
+
+
+def _valid_max_post_url(url: str) -> bool:
+    try:
+        parts = urlsplit(url)
+        host = (parts.hostname or "").lower()
+        return bool(
+            parts.scheme.lower() == "https" and host
+            and (host == "max.ru" or host.endswith(".max.ru"))
+            and parts.path not in {"", "/"}
+            and not parts.username and not parts.password
+            and parts.port in {None, 443}
+        )
+    except ValueError:
+        return False
+
+
+def _extract_channel_post(result: object) -> tuple[str, str]:
+    """Validate the documented channel-post response before recording success."""
+    if not isinstance(result, dict):
+        raise ValueError("MAX вернул JSON не в виде объекта")
+    message = result.get("message")
+    if not isinstance(message, dict):
+        raise ValueError("В ответе MAX отсутствует объект созданного сообщения")
+    body = message.get("body")
+    if not isinstance(body, dict) or not body.get("mid"):
+        raise ValueError("В ответе MAX отсутствует ID созданного сообщения (message.body.mid)")
+    message_url = message.get("url")
+    if not isinstance(message_url, str) or not _valid_max_post_url(message_url):
+        raise ValueError("В ответе MAX отсутствует действительная публичная HTTPS-ссылка на пост")
+    return message_url, str(body["mid"])
 
 
 def publish(db: sqlite3.Connection, draft_id: int, dry_run: bool = False,
@@ -23,10 +56,12 @@ def publish(db: sqlite3.Connection, draft_id: int, dry_run: bool = False,
     if draft["status"] != "approved":
         raise ValueError("Публиковать можно только черновик со статусом approved")
     _assert_selected_batch_part(db, draft, now)
-    token = os.environ.get("MAX_BOT_TOKEN")
-    channel_id = os.environ.get("MAX_CHANNEL_ID")
+    token, channel_id = get_max_credentials()
     if not dry_run and (not token or not channel_id):
-        raise RuntimeError("Для публикации нужны переменные MAX_BOT_TOKEN и MAX_CHANNEL_ID")
+        raise RuntimeError(
+            "Для публикации настройте MAX credentials командой "
+            "python -m app credentials set-max либо задайте MAX_BOT_TOKEN и MAX_CHANNEL_ID"
+        )
     if dry_run:
         _assert_daily_slot_available(db, draft, now=now)
         return {"status": "dry_run", "text": draft["body"]}
@@ -62,6 +97,7 @@ def publish(db: sqlite3.Connection, draft_id: int, dry_run: bool = False,
     try:
         with urllib.request.urlopen(request, timeout=30) as response:
             result = json.loads(response.read().decode("utf-8"))
+            message_url, api_message_id = _extract_channel_post(result)
     except urllib.error.HTTPError as exc:
         detail = exc.read(2000).decode("utf-8", errors="replace")
         state = "failed" if 400 <= exc.code < 500 else "unknown"
@@ -78,7 +114,6 @@ def publish(db: sqlite3.Connection, draft_id: int, dry_run: bool = False,
         record_event(db, "publish_outcome_unknown", "draft", draft_id,
                      {"attempt_no": attempt_no, "error": f"{type(exc).__name__}: {exc}"})
         raise RuntimeError("Не удалось достоверно узнать результат отправки. Проверьте канал и выполните publish-resolve; не отправляйте повторно вслепую.") from exc
-    message_url = result.get("message", {}).get("url") or result.get("url") or ""
     published_at = now_iso()
     db.execute("UPDATE drafts SET status='published',published_at=?,updated_at=?,max_post_url=? WHERE id=?",
                (published_at, published_at, message_url, draft_id))
@@ -86,7 +121,7 @@ def publish(db: sqlite3.Connection, draft_id: int, dry_run: bool = False,
                (message_url, draft_id, attempt_no))
     db.commit()
     record_event(db, "draft_published", "draft", draft_id,
-                 {"max_post_url": message_url, "api_message_id": result.get("message", {}).get("body", {}).get("mid")})
+                 {"max_post_url": message_url, "api_message_id": api_message_id})
     return {"status": "published", "url": message_url}
 
 
@@ -174,15 +209,16 @@ def _approval_checks_complete(db: sqlite3.Connection, draft: sqlite3.Row) -> boo
         required.append("groups_checked")
     if not all(checks.get(key) is True for key in required):
         return False
-    claims = db.execute(
-        """SELECT COUNT(*) AS total,
-                  SUM(CASE WHEN link_checked_at IS NOT NULL AND claim_text<>'' AND source_id<>''
-                           AND source_name<>'' AND published_at<>'' AND source_url<>''
-                           AND event_date_status IN ('explicit','same_day') AND event_date IS NOT NULL
-                           AND event_date_reviewed_at IS NOT NULL THEN 1 ELSE 0 END) AS reviewed
-           FROM draft_claims WHERE draft_id=? AND included=1""", (draft["id"],)
-    ).fetchone()
-    if not claims["total"] or claims["total"] != claims["reviewed"]:
+    claims = list(db.execute(
+        "SELECT * FROM draft_claims WHERE draft_id=? AND included=1", (draft["id"],)
+    ))
+    if not claims or any(
+        not all(claim[key] for key in ("claim_text", "source_id", "source_name", "published_at", "source_url"))
+        or claim["event_date_status"] not in {"explicit", "same_day"}
+        or not claim["event_date"] or not claim["event_date_reviewed_at"]
+        or not claim_link_check_is_current(claim)
+        for claim in claims
+    ):
         return False
     unchecked_groups = db.execute(
         """SELECT COUNT(*) FROM (
@@ -279,12 +315,16 @@ def resolve_attempt(db: sqlite3.Connection, draft_id: int, posted: bool, url: st
     if attempt is None or attempt["state"] not in {"started", "unknown"}:
         raise ValueError("Для черновика нет неопределённой попытки публикации")
     if posted:
+        if not _valid_max_post_url(url):
+            raise ValueError("Для разрешения как опубликованного укажите действительную ссылку на пост HTTPS на max.ru")
         published_at = now_iso()
         db.execute("UPDATE drafts SET status='published',published_at=?,updated_at=?,max_post_url=? WHERE id=?",
                    (published_at, published_at, url, draft_id))
         db.execute("UPDATE publish_attempts SET state='succeeded',details=? WHERE id=?", (url, attempt["id"]))
         record_event(db, "publish_resolved_as_posted", "draft", draft_id, {"url": url})
     else:
+        if url.strip():
+            raise ValueError("--url применим только вместе с --posted")
         db.execute("UPDATE publish_attempts SET state='failed',details='Редактор проверил канал: публикации нет' WHERE id=?",
                    (attempt["id"],))
         record_event(db, "publish_resolved_as_not_posted", "draft", draft_id)

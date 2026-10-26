@@ -25,20 +25,30 @@ def assess_relevance(item: dict[str, Any], source: dict[str, Any]) -> dict[str, 
                 found.append(term)
         return found
 
+    # Only explicit front-line markers are eligible for automatic inclusion.
+    # A country/region plus a generic conflict word is merely a review candidate:
+    # it may describe strikes, diplomacy, or consequences far from the front.
     high = matches(config.get("high_confidence_terms"))
     geography = matches(config.get("geography_terms"))
     conflict = matches(config.get("conflict_terms"))
+    frontline_actions = matches(config.get("frontline_action_terms"))
     context = matches(config.get("context_terms"))
-    hits = list(dict.fromkeys(high + geography + conflict + context))
-    if high or (geography and conflict):
+    hits = list(dict.fromkeys(high + geography + conflict + frontline_actions + context))
+    if high or (geography and frontline_actions):
         confidence, status = "high", "included"
-        reason = "Сильный тематический маркер" if high else "Совпали географический и военный контекст"
+        reason = ("Найден явный маркер линии фронта; редактор всё равно проверяет материал"
+                  if high else "Совпали география и маркер изменения обстановки на фронте; нужна редакторская проверка")
+    elif geography and conflict:
+        confidence, status = "medium", "review"
+        reason = "Есть географический и военный контекст, но связь именно с линией фронта требует проверки"
     elif hits:
         confidence, status = "medium", "review"
         reason = "Есть тематические маркеры, но связь с темой требует редакторской проверки"
     else:
-        confidence, status = "low", "review"
-        reason = "Словарь не нашёл совпадений; материал сохранён для проверки возможного пропуска"
+        # Keep unmatched feed noise out of the active queue. The complete
+        # record remains in the database and can be audited under `excluded`.
+        confidence, status = "low", "excluded"
+        reason = "Тематические маркеры не найдены; исключено из черновиков и активной очереди, доступно для аудита"
     return {"confidence": confidence, "status": status, "matched_terms": hits, "reason": reason}
 
 
