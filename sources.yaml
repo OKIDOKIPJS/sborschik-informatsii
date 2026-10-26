@@ -66,19 +66,23 @@ sources:
       - 'Это позиция правительства Великобритании, а не нейтральный первичный источник о каждом событии на линии фронта.'
       - 'Лента содержит публикации на разные темы; каждый кандидат требует проверки редактором.'
     relevance_filter:
-      version: 2
-      matching: 'case-insensitive whole words and phrases; uncertain or unmatched items remain in the editorial relevance queue'
+      version: 5
+      matching: 'case-insensitive whole words and phrases; medium-confidence matches enter editorial review; unmatched feed noise is retained as excluded and remains auditable'
       high_confidence_terms:
-        - war in Ukraine
-        - Ukraine war
-        - Russian invasion of Ukraine
         - frontline
         - front-line
         - front line
         - frontlines
+        - front lines
         - battlefront
-        - battlefield
         - line of contact
+        - contact line
+        - frontline fighting
+        - front-line fighting
+        - fighting on the front line
+        - fighting along the front line
+        - front-line situation
+        - frontline situation
       geography_terms:
         - Ukraine
         - Ukrainian
@@ -127,23 +131,32 @@ sources:
         - air defense
         - defence
         - defense
+      frontline_action_terms:
+        - advance
+        - advanced
+        - advances
+        - advancing
+        - capture
+        - captured
+        - captures
+        - recapture
+        - recaptured
+        - retake
+        - retook
+        - seized
+        - took control
+        - changed hands
+        - withdrew
+        - withdrawal
+        - retreated
+        - retreat
+        - pushed forward
+        - territorial gains
       context_terms:
-        - Russia
-        - Russian
-        - Ukraine
-        - Ukrainian
-        - Donbas
-        - Donbass
-        - Donetsk
-        - Luhansk
-        - Lugansk
-        - Crimea
-        - occupied
-        - annexed
-        - mobilization
-        - mobilisation
-        - territorial
-      policy: 'Strong conflict phrase or a geographic and conflict term pair is high confidence. A partial match or no match is retained for editorial review; no feed entry is silently discarded by this relevance filter.'
+        - war in Ukraine
+        - Ukraine war
+        - Russian invasion of Ukraine
+      policy: 'Explicit front-line markers, or a configured geography combined with a front-line action marker, become high-confidence candidates. Geography combined only with generic military terms remains in editorial review. High-confidence means candidate selection, not verified fact or publication. Unmatched entries are retained as excluded, remain auditable, and may be included by an editor; they do not enter the active review queue or drafts automatically.'
     verification_rule: 'Формулировать как заявление или оценку британского ведомства; не считать независимым подтверждением события.'
     enabled: true
 
