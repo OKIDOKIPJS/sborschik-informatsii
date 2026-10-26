@@ -1,4 +1,4 @@
-"""Выявление совпадений по канонической ссылке и отпечатку текста."""
+"""Выявление повторных наблюдений одной публикации по канонической ссылке."""
 from __future__ import annotations
 
 import sqlite3
@@ -9,14 +9,13 @@ from .logs import record_event
 
 def insert_normalized(db: sqlite3.Connection, raw_id: int, item: dict[str, Any]) -> tuple[int | None, str]:
     found = db.execute(
-        """SELECT id FROM items WHERE source_id=? AND (url=? OR content_hash=?)
-           ORDER BY CASE WHEN url=? THEN 0 ELSE 1 END LIMIT 1""",
-        (item["source_id"], item["url"], item["content_hash"], item["url"]),
+        "SELECT id FROM items WHERE source_id=? AND url=?",
+        (item["source_id"], item["url"]),
     ).fetchone()
     if found:
         record_event(db, "duplicate_skipped", "item", found["id"],
                      {"source_id": item["source_id"], "incoming_url": item["url"],
-                      "matched_by": "same_source_url_or_content_hash"})
+                      "matched_by": "same_source_url"})
         return int(found["id"]), "duplicate"
     same_url = list(db.execute(
         "SELECT id,source_id,source_name FROM items WHERE url=? AND source_id<>? ORDER BY id",

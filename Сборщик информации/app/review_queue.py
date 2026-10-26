@@ -1,19 +1,99 @@
 """Очередь редакторской проверки и одобрения."""
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
+from functools import wraps
 from datetime import date, datetime, time, timedelta, timezone
 from urllib.parse import urlsplit
 
 from .config import get_source, load_sources
 from .corrections import correction_evidence_is_current
 from .draft_generator import _source_summary_excerpt
-from .logs import now_iso, record_event
+from .logs import now_iso
 from .publication_validator import check_publication_link
 
 MOSCOW = timezone(timedelta(hours=3))
 LINK_REVIEW_TTL = timedelta(hours=24)
+
+
+def _audit(db: sqlite3.Connection, kind: str, entity_type: str | None = None,
+           entity_id: str | int | None = None, details: object = "") -> None:
+    """Write an audit record in the caller's transaction, without committing."""
+    db.execute(
+        "INSERT INTO events(created_at,kind,entity_type,entity_id,details) VALUES(?,?,?,?,?)",
+        (now_iso(), kind, entity_type, str(entity_id) if entity_id is not None else None,
+         json.dumps(details, ensure_ascii=False) if not isinstance(details, str) else details),
+    )
+
+
+def _assert_editable(db: sqlite3.Connection, draft_id: int,
+                     expected_revision: int | None = None) -> sqlite3.Row:
+    draft = get_draft(db, draft_id)
+    if draft["status"] != "pending":
+        raise ValueError(f"Изменение возможно только для pending-черновика; сейчас {draft['status']}")
+    if expected_revision is not None and draft["revision"] != expected_revision:
+        raise ValueError("Черновик уже изменён другим действием. Обновите карточку и повторите проверку.")
+    if db.execute("SELECT 1 FROM publish_attempts WHERE draft_id=? AND state IN ('started','unknown') LIMIT 1",
+                  (draft_id,)).fetchone():
+        raise ValueError("Есть незавершённая попытка публикации; сначала проверьте канал и выполните publish-resolve.")
+    return draft
+
+
+def _pending_mutation(function):
+    """Serialize editor changes and their audit event, including CLI calls."""
+    @wraps(function)
+    def wrapped(db, draft_id, *args, expected_revision=None, **kwargs):
+        db.execute("BEGIN IMMEDIATE")
+        try:
+            _assert_editable(db, draft_id, expected_revision)
+            result = function(db, draft_id, *args, **kwargs)
+            db.commit()
+            return result
+        except Exception:
+            db.rollback()
+            raise
+    return wrapped
+
+
+def _batch_mutation(function):
+    @wraps(function)
+    def wrapped(db, batch_id, draft_id, *args, expected_revision=None, **kwargs):
+        db.execute("BEGIN IMMEDIATE")
+        try:
+            draft = get_draft(db, draft_id)
+            if draft["status"] not in {"pending", "approved"}:
+                raise ValueError("Часть должна быть pending или approved")
+            if expected_revision is not None and draft["revision"] != expected_revision:
+                raise ValueError("Черновик уже изменён. Обновите карточку.")
+            if db.execute(
+                """SELECT 1 FROM publish_attempts a JOIN digest_batch_parts p ON p.draft_id=a.draft_id
+                   WHERE p.batch_id=? AND a.state IN ('started','unknown') LIMIT 1""", (batch_id,)
+            ).fetchone():
+                raise ValueError("В партии есть незавершённая публикация; сначала выполните publish-resolve")
+            result = function(db, batch_id, draft_id, *args, **kwargs)
+            db.commit()
+            return result
+        except Exception:
+            db.rollback()
+            raise
+    return wrapped
+
+
+def approval_fingerprint(db: sqlite3.Connection, draft: sqlite3.Row) -> str:
+    """Hash the exact text and evidence which the editor approved."""
+    fields = ("title", "body", "correction_of_id", "requires_group_review",
+              "correction_reason", "correction_text", "correction_source_id", "correction_source_url",
+              "correction_original_url", "correction_publication_check_status",
+              "correction_publication_checked_at", "correction_link_checked_at", "correction_link_check_note")
+    snapshot = {key: draft[key] for key in fields}
+    for table in ("draft_claims", "draft_groups", "revision_alerts"):
+        snapshot[table] = [dict(row) for row in db.execute(
+            f"SELECT * FROM {table} WHERE draft_id=? ORDER BY id", (draft["id"],)
+        )]
+    return hashlib.sha256(json.dumps(snapshot, ensure_ascii=False, sort_keys=True,
+                                     separators=(",", ":")).encode("utf-8")).hexdigest()
 
 
 def list_drafts(db: sqlite3.Connection, status: str | None = None) -> list[sqlite3.Row]:
@@ -44,6 +124,7 @@ def batch_parts(db: sqlite3.Connection, batch_id: str) -> list[sqlite3.Row]:
     ))
 
 
+@_batch_mutation
 def select_batch_part(db: sqlite3.Connection, batch_id: str, draft_id: int) -> None:
     parts = batch_parts(db, batch_id)
     target = next((part for part in parts if int(part["draft_id"]) == draft_id), None)
@@ -55,20 +136,15 @@ def select_batch_part(db: sqlite3.Connection, batch_id: str, draft_id: int) -> N
         raise ValueError(f"Часть должна быть pending или approved; сейчас {target['status']}")
     now = now_iso()
     previous = [int(part["draft_id"]) for part in parts if part["disposition"] == "selected"]
-    db.execute("BEGIN IMMEDIATE")
-    try:
-        db.execute("UPDATE digest_batch_parts SET disposition='open',updated_at=? WHERE batch_id=? AND disposition='selected'",
-                   (now, batch_id))
-        db.execute("UPDATE digest_batch_parts SET disposition='selected',deferred_until=NULL,note='',updated_at=? WHERE draft_id=?",
-                   (now, draft_id))
-        db.commit()
-    except Exception:
-        db.rollback()
-        raise
-    record_event(db, "batch_part_selected", "draft", draft_id,
+    db.execute("UPDATE digest_batch_parts SET disposition='open',updated_at=? WHERE batch_id=? AND disposition='selected'",
+               (now, batch_id))
+    db.execute("UPDATE digest_batch_parts SET disposition='selected',deferred_until=NULL,note='',updated_at=? WHERE draft_id=?",
+               (now, draft_id))
+    _audit(db, "batch_part_selected", "draft", draft_id,
                  {"batch_id": batch_id, "part_no": target["part_no"], "previously_selected": previous})
 
 
+@_batch_mutation
 def close_batch_part(db: sqlite3.Connection, batch_id: str, draft_id: int, reason: str) -> None:
     part = next((part for part in batch_parts(db, batch_id) if int(part["draft_id"]) == draft_id), None)
     if part is None:
@@ -82,11 +158,11 @@ def close_batch_part(db: sqlite3.Connection, batch_id: str, draft_id: int, reaso
                (reason.strip(), now, draft_id))
     db.execute("UPDATE drafts SET status='rejected',updated_at=? WHERE id=? AND status IN ('pending','approved')",
                (now, draft_id))
-    db.commit()
-    record_event(db, "batch_part_closed", "draft", draft_id,
+    _audit(db, "batch_part_closed", "draft", draft_id,
                  {"batch_id": batch_id, "part_no": part["part_no"], "reason": reason.strip()})
 
 
+@_batch_mutation
 def defer_batch_part(db: sqlite3.Connection, batch_id: str, draft_id: int,
                      until_date: str, note: str) -> None:
     part = next((part for part in batch_parts(db, batch_id) if int(part["draft_id"]) == draft_id), None)
@@ -120,8 +196,7 @@ def defer_batch_part(db: sqlite3.Connection, batch_id: str, draft_id: int,
                (target_day.isoformat(), note.strip(), now, draft_id))
     db.execute("UPDATE drafts SET status='rejected',updated_at=? WHERE id=? AND status IN ('pending','approved')",
                (now, draft_id))
-    db.commit()
-    record_event(db, "batch_part_deferred", "draft", draft_id, {
+    _audit(db, "batch_part_deferred", "draft", draft_id, {
         "batch_id": batch_id, "part_no": part["part_no"], "until": target_day.isoformat(),
         "note": note.strip(), "oldest_publication": min(published).isoformat(),
         "expires_at": expires_at.isoformat(),
@@ -159,6 +234,7 @@ def revision_alerts(db: sqlite3.Connection, draft_id: int) -> list[sqlite3.Row]:
     ))
 
 
+@_pending_mutation
 def review_source_revision(db: sqlite3.Connection, draft_id: int, claim_id: int,
                            mode: str, note: str) -> None:
     draft = get_draft(db, draft_id)
@@ -234,8 +310,7 @@ def review_source_revision(db: sqlite3.Connection, draft_id: int, claim_id: int,
         ("refreshed" if mode == "refresh" else "kept", note.strip(), reviewed_at,
          draft_id, claim_id, alert["current_version_id"]),
     )
-    db.commit()
-    record_event(db, "source_revision_reviewed", "draft_claim", claim_id, {
+    _audit(db, "source_revision_reviewed", "draft_claim", claim_id, {
         "draft_id": draft_id, "mode": mode, "current_version_id": alert["current_version_id"],
         "note": note.strip(),
     })
@@ -308,6 +383,7 @@ def _event_date_line(status: str, event_date: str | None, published_at: str | No
     return "— Дата события не проверена редактором; требуется уточнить до одобрения."
 
 
+@_pending_mutation
 def review_claim_event_date(db: sqlite3.Connection, draft_id: int, claim_id: int,
                             mode: str, event_date: str | None = None, note: str = "") -> None:
     draft = get_draft(db, draft_id)
@@ -361,13 +437,13 @@ def review_claim_event_date(db: sqlite3.Connection, draft_id: int, claim_id: int
         (resolved_date, status, note.strip(), reviewed_at, claim_id),
     )
     db.execute("UPDATE drafts SET body=?,updated_at=? WHERE id=?", (updated_body, reviewed_at, draft_id))
-    db.commit()
-    record_event(db, "claim_event_date_reviewed", "draft_claim", claim_id, {
+    _audit(db, "claim_event_date_reviewed", "draft_claim", claim_id, {
         "draft_id": draft_id, "event_date": resolved_date, "status": status,
         "note": note.strip(),
     })
 
 
+@_pending_mutation
 def exclude_claim(db: sqlite3.Connection, draft_id: int, claim_id: int, reason: str) -> None:
     draft = get_draft(db, draft_id)
     if draft["status"] != "pending":
@@ -401,8 +477,7 @@ def exclude_claim(db: sqlite3.Connection, draft_id: int, claim_id: int, reason: 
            review_note='',reviewed_at=NULL WHERE id=?""", (claim["group_id"],)
     )
     db.execute("UPDATE drafts SET body=?,updated_at=? WHERE id=?", (updated_body, excluded_at, draft_id))
-    db.commit()
-    record_event(db, "claim_excluded", "draft_claim", claim_id,
+    _audit(db, "claim_excluded", "draft_claim", claim_id,
                  {"draft_id": draft_id, "reason": reason.strip()})
 
 
@@ -430,51 +505,59 @@ def claim_link_check_is_current(claim: sqlite3.Row, now: datetime | None = None)
 
 
 def mark_claim_link_checked(db: sqlite3.Connection, draft_id: int, claim_id: int,
-                            checked: bool, note: str) -> dict[str, str]:
-    draft = get_draft(db, draft_id)
-    if draft["status"] != "pending":
-        raise ValueError("Проверять утверждения можно только в pending-черновике")
+                            checked: bool, note: str,
+                            expected_revision: int | None = None) -> dict[str, str]:
+    draft = _assert_editable(db, draft_id, expected_revision)
+    revision = int(draft["revision"])
     claim = db.execute(
         "SELECT * FROM draft_claims WHERE id=? AND draft_id=? AND included=1", (claim_id, draft_id)
     ).fetchone()
     if claim is None:
         raise ValueError(f"Утверждение #{claim_id} не относится к черновику #{draft_id}")
-    if not checked:
-        raise ValueError("Подтвердите, что вы открыли ссылку и сверили её с утверждением")
-    if not note.strip():
-        raise ValueError("Добавьте краткое пояснение: что именно на странице подтверждает утверждение")
+    if not checked or not note.strip():
+        raise ValueError("Подтвердите открытие ссылки и добавьте пояснение проверки (claim-check --note)")
     parts = urlsplit(claim["source_url"])
     if parts.scheme not in {"http", "https"} or not parts.netloc:
         raise ValueError(f"У утверждения #{claim_id} нет действительной HTTP(S)-ссылки")
+    failure = None
+    publication_check = None
     try:
         source = get_source(load_sources(), claim["source_id"])
         publication_check = check_publication_link(source, claim["source_url"], origin="manual")
     except Exception as exc:
-        # A failed recheck must invalidate any earlier attestation immediately.
-        db.execute(
-            """UPDATE draft_claims SET link_checked_at=NULL,link_check_note='',
-               publication_check_status='',publication_checked_at=NULL WHERE id=?""",
-            (claim_id,),
-        )
+        failure = exc
+    # Do not hold SQLite's write lock while a remote site is answering. Refuse
+    # to attest any different text/evidence than the one checked above.
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        _assert_editable(db, draft_id, revision)
+        if failure is not None:
+            db.execute(
+                """UPDATE draft_claims SET link_checked_at=NULL,link_check_note='',
+                   publication_check_status='',publication_checked_at=NULL WHERE id=?""", (claim_id,)
+            )
+            _audit(db, "claim_link_check_failed", "draft_claim", claim_id,
+                   {"draft_id": draft_id, "source_url": claim["source_url"],
+                    "error": f"{type(failure).__name__}: {failure}"})
+        else:
+            db.execute(
+                """UPDATE draft_claims SET link_checked_at=?,link_check_note=?,
+                   publication_check_status=?,publication_checked_at=? WHERE id=?""",
+                (now_iso(), note.strip(), publication_check["status"], publication_check["checked_at"], claim_id),
+            )
+            _audit(db, "claim_link_checked", "draft_claim", claim_id,
+                   {"draft_id": draft_id, "source_url": claim["source_url"],
+                    "editor_note": note.strip(), "publication_check": publication_check})
         db.commit()
-        record_event(db, "claim_link_check_failed", "draft_claim", claim_id,
-                     {"draft_id": draft_id, "source_url": claim["source_url"],
-                      "error": f"{type(exc).__name__}: {exc}"})
+    except Exception:
+        db.rollback()
         raise
-    checked_at = now_iso()
-    db.execute(
-        """UPDATE draft_claims SET link_checked_at=?,link_check_note=?,
-           publication_check_status=?,publication_checked_at=? WHERE id=?""",
-        (checked_at, note.strip(), publication_check["status"],
-         publication_check["checked_at"], claim_id),
-    )
-    db.commit()
-    record_event(db, "claim_link_checked", "draft_claim", claim_id,
-                 {"draft_id": draft_id, "source_url": claim["source_url"],
-                  "editor_note": note.strip(), "publication_check": publication_check})
+    if failure is not None:
+        raise failure
     return publication_check
 
 
+@_pending_mutation
 def review_candidate_group(db: sqlite3.Connection, draft_id: int, group_no: int,
                            same_event: bool, independent: bool, note: str = "") -> None:
     draft = get_draft(db, draft_id)
@@ -511,13 +594,13 @@ def review_candidate_group(db: sqlite3.Connection, draft_id: int, group_no: int,
            WHERE id=?""",
         (int(same_event), int(independent), note.strip(), reviewed_at, group["id"]),
     )
-    db.commit()
-    record_event(db, "candidate_group_reviewed", "draft_group", group["id"], {
+    _audit(db, "candidate_group_reviewed", "draft_group", group["id"], {
         "draft_id": draft_id, "group_no": group_no, "same_event": same_event,
         "sources_independent": independent, "note": note.strip(),
     })
 
 
+@_pending_mutation
 def edit_draft(db: sqlite3.Connection, draft_id: int, text: str) -> None:
     draft = get_draft(db, draft_id)
     if draft["status"] != "pending":
@@ -542,23 +625,22 @@ def edit_draft(db: sqlite3.Connection, draft_id: int, text: str) -> None:
                correction_publication_checked_at=NULL,correction_link_checked_at=NULL,
                correction_link_check_note='' WHERE id=?""", (draft_id,)
         )
-    db.commit()
-    record_event(db, "draft_corrected", "draft", draft_id,
+    _audit(db, "draft_corrected", "draft", draft_id,
                  {"previous_text": draft["body"], "corrected_text": text})
 
 
-def set_decision(db: sqlite3.Connection, draft_id: int, decision: str,
-                 checks: dict[str, bool] | None = None) -> None:
-    if decision not in {"approved", "rejected"}:
-        raise ValueError("Решение должно быть approved или rejected")
-    draft = get_draft(db, draft_id)
-    if draft["status"] != "pending":
-        raise ValueError(f"Решение возможно только для pending-черновика; сейчас {draft['status']}")
-    checks = checks or {}
+def validate_approval(db: sqlite3.Connection, draft: sqlite3.Row,
+                      checks: dict[str, bool], now: datetime | None = None) -> dict[str, bool]:
+    """Validate text and evidence without changing the draft or audit log."""
+    decision = "approved"
+    draft_id = int(draft["id"])
+    checks = dict(checks)
+    if not draft["body"].strip() or len(draft["body"]) > 4000:
+        raise ValueError("Текст должен содержать от 1 до 4000 символов")
     if decision == "approved":
-        if not checks.get("evidence_checked"):
+        if checks.get("evidence_checked") is not True:
             raise ValueError("Перед одобрением подтвердите проверку содержания публикаций и ссылок: --evidence-checked")
-        if not checks.get("independence_checked"):
+        if checks.get("independence_checked") is not True:
             raise ValueError("Перед одобрением подтвердите проверку независимости оснований: --independence-checked")
     if decision == "approved" and draft["correction_of_id"]:
         original = db.execute(
@@ -577,7 +659,7 @@ def set_decision(db: sqlite3.Connection, draft_id: int, decision: str,
                 "В черновике исправления должны совпадать сохранённые ошибочная и исправленная формулировки, "
                 "разрешённое основание и ссылка на исходный пост"
             )
-        if not correction_evidence_is_current(draft):
+        if not correction_evidence_is_current(draft, now=now):
             raise ValueError(
                 "Перед одобрением исправления выполните review correction-check ID --note, "
                 "откройте ссылку и сохраните короткое основание проверки; отметка действует 24 часа."
@@ -601,7 +683,7 @@ def set_decision(db: sqlite3.Connection, draft_id: int, decision: str,
             parts = urlsplit(claim["source_url"])
             if parts.scheme not in {"http", "https"} or not parts.netloc:
                 raise ValueError(f"Утверждение #{claim['id']}: ссылка должна быть действительной HTTP(S)-ссылкой")
-            if not claim_link_check_is_current(claim):
+            if not claim_link_check_is_current(claim, now=now):
                 raise ValueError(
                     f"Утверждение #{claim['id']}: повторно откройте ссылку, проверьте её доступность "
                     "и соответствие утверждению, затем выполните интерактивную команду review claim-check --note. "
@@ -693,7 +775,96 @@ def set_decision(db: sqlite3.Connection, draft_id: int, decision: str,
                         f"Утверждение #{claim['id']}: статус «подтверждено» допустим только при нескольких "
                         "разных, независимо проверенных неаналитических источниках об одном событии."
                     )
-    db.execute("UPDATE drafts SET status=?,updated_at=? WHERE id=?", (decision, now_iso(), draft_id))
-    db.commit()
-    record_event(db, f"draft_{decision}", "draft", draft_id,
-                 {"editor_checks": checks} if decision == "approved" else "")
+        if seen_statements != set(bullet_positions):
+            raise ValueError("Каждый пункт текста должен однозначно соответствовать сохранённому утверждению")
+    return checks
+
+
+@_pending_mutation
+def set_decision(db: sqlite3.Connection, draft_id: int, decision: str,
+                 checks: dict[str, bool] | None = None) -> None:
+    if decision not in {"approved", "rejected"}:
+        raise ValueError("Решение должно быть approved или rejected")
+    draft = get_draft(db, draft_id)
+    checks = validate_approval(db, draft, checks or {}) if decision == "approved" else {}
+    fingerprint = approval_fingerprint(db, draft) if decision == "approved" else ""
+    db.execute(
+        """UPDATE drafts SET status=?,updated_at=?,approved_revision=?,approved_hash=?
+           WHERE id=? AND status='pending' AND revision=?""",
+        (decision, now_iso(), draft["revision"] if decision == "approved" else None,
+         fingerprint, draft_id, draft["revision"]),
+    )
+    _audit(db, f"draft_{decision}", "draft", draft_id,
+           {"editor_checks": checks, "revision": draft["revision"], "body_hash": fingerprint})
+
+
+def _approval_event_checks(db: sqlite3.Connection, draft_id: int) -> dict[str, bool]:
+    event = db.execute(
+        """SELECT details FROM events WHERE kind='draft_approved' AND entity_type='draft'
+           AND entity_id=? ORDER BY id DESC LIMIT 1""", (str(draft_id),)
+    ).fetchone()
+    try:
+        details = json.loads(event["details"]) if event else {}
+        checks = details.get("editor_checks", {})
+        return checks if isinstance(checks, dict) else {}
+    except (TypeError, AttributeError, json.JSONDecodeError):
+        return {}
+
+
+def approval_blockers(db: sqlite3.Connection, draft_id: int,
+                      now: datetime | None = None) -> list[str]:
+    """Read-only readiness for the editor; approval still requires attestation."""
+    draft = get_draft(db, draft_id)
+    blockers: list[str] = []
+    if draft["status"] not in {"pending", "approved"}:
+        blockers.append(f"Черновик имеет статус {draft['status']}")
+    checks = {"evidence_checked": True, "independence_checked": True, "groups_checked": True}
+    if draft["status"] == "approved":
+        checks = _approval_event_checks(db, draft_id)
+        if (draft["approved_revision"] != draft["revision"] or not draft["approved_hash"]
+                or draft["approved_hash"] != approval_fingerprint(db, draft)):
+            blockers.append("Одобрение не относится к текущей версии. Верните черновик на проверку и одобрите заново.")
+    for claim in draft_claims(db, draft_id):
+        if not claim["included"]:
+            continue
+        if not claim_link_check_is_current(claim, now=now):
+            blockers.append(f"Утверждение #{claim['id']}: требуется свежая проверка ссылки (claim-check)")
+        if (claim["event_date_status"] not in {"explicit", "same_day"}
+                or not claim["event_date"] or not claim["event_date_reviewed_at"]):
+            blockers.append(f"Утверждение #{claim['id']}: требуется проверка даты события (event-date)")
+    if db.execute("SELECT 1 FROM revision_alerts WHERE draft_id=? AND resolution IS NULL LIMIT 1",
+                  (draft_id,)).fetchone():
+        blockers.append("Есть непроверенная новая версия источника (revision-check)")
+    for group in draft_groups(db, draft_id):
+        if int(group["claim_count"] or 0) > 1 and (
+            group["review_same_event"] is None or group["sources_independent"] is None
+            or not group["reviewed_at"] or not group["review_note"].strip()
+        ):
+            blockers.append(f"Группа #{group['group_no']}: требуется редакторская проверка (group-check)")
+    try:
+        validate_approval(db, draft, checks, now=now)
+    except (ValueError, TypeError, KeyError) as exc:
+        blockers.append(str(exc))
+    return list(dict.fromkeys(blockers))
+
+
+def reopen_draft(db: sqlite3.Connection, draft_id: int,
+                 expected_revision: int | None = None) -> None:
+    """Explicitly revoke approval without changing the saved text or evidence."""
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        draft = get_draft(db, draft_id)
+        if draft["status"] not in {"approved", "rejected"}:
+            raise ValueError("Вернуть на проверку можно approved или rejected черновик")
+        if expected_revision is not None and draft["revision"] != expected_revision:
+            raise ValueError("Черновик уже изменён. Обновите карточку.")
+        if db.execute("SELECT 1 FROM publish_attempts WHERE draft_id=? AND state IN ('started','unknown','succeeded') LIMIT 1",
+                      (draft_id,)).fetchone():
+            raise ValueError("Сначала разрешите незавершённую попытку публикации; опубликованный текст не переоткрывается.")
+        db.execute("""UPDATE drafts SET status='pending',revision=revision+1,approved_revision=NULL,
+                   approved_hash='',updated_at=? WHERE id=?""", (now_iso(), draft_id))
+        _audit(db, "draft_reopened", "draft", draft_id, {"previous_status": draft["status"]})
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise

@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sborschik-informatsii"
+version = "0.2.0"
+description = "Локальный сбор материалов и редакторский кабинет для MAX"
+requires-python = ">=3.11"
+dependencies = ["PyYAML>=6.0,<7.0"]
+
+[project.optional-dependencies]
+model = ["sentence-transformers>=3.0,<6.0"]
+
+[project.scripts]
+sborschik = "app.cli:main"
+
+[tool.setuptools]
+packages = ["app"]
+
+[tool.setuptools.package-data]
+app = ["static/*.html", "static/*.css", "static/*.js"]

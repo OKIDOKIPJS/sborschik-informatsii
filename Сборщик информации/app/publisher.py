@@ -12,11 +12,72 @@ from urllib.parse import urlsplit
 
 from .credentials import get_max_credentials
 from .logs import now_iso, record_event
-from .review_queue import claim_link_check_is_current, get_draft
+from .review_queue import _audit, approval_blockers, approval_fingerprint, get_draft
 
 API_URL = "https://platform-api2.max.ru/messages"
 MOSCOW = timezone(timedelta(hours=3))
 PUBLISH_AT = time(14, 0)
+PUBLISH_LEASE = timedelta(minutes=5)
+
+
+def _redact(value: object, token: str | None) -> str:
+    text = str(value)
+    if token:
+        for secret in {token, urllib.parse.quote(token, safe=""), urllib.parse.quote_plus(token)}:
+            text = text.replace(secret, "[REDACTED_SECRET]")
+    return text[:2000]
+
+
+def _process_alive(pid: int | None) -> bool:
+    if not pid or pid <= 0:
+        return False
+    if os.name == "nt":
+        import ctypes
+        from ctypes import wintypes
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+        kernel.OpenProcess.restype = wintypes.HANDLE
+        kernel.GetExitCodeProcess.argtypes = (wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD))
+        kernel.CloseHandle.argtypes = (wintypes.HANDLE,)
+        handle = kernel.OpenProcess(0x1000, False, pid)
+        if not handle:
+            # An access-denied process is alive; unknown errors fail closed.
+            return ctypes.get_last_error() != 87
+        try:
+            exit_code = wintypes.DWORD()
+            return not kernel.GetExitCodeProcess(handle, ctypes.byref(exit_code)) or exit_code.value == 259
+        finally:
+            kernel.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True
+
+
+def publish_preflight(db: sqlite3.Connection, draft_id: int,
+                      now: datetime | None = None, *,
+                      expected_revision: int | None = None) -> list[str]:
+    """Return publication blockers without secrets, network, or state changes."""
+    draft = get_draft(db, draft_id)
+    blockers = approval_blockers(db, draft_id)
+    if expected_revision is not None and draft["revision"] != expected_revision:
+        blockers.insert(0, "Черновик уже изменён. Обновите карточку и подтвердите публикацию текущей версии.")
+    if draft["status"] != "approved":
+        blockers.insert(0, "Публиковать можно только черновик со статусом approved")
+    for check in (_assert_selected_batch_part, _assert_daily_slot_available):
+        try:
+            check(db, draft, now=now)
+        except ValueError as exc:
+            blockers.append(str(exc))
+    previous = db.execute(
+        "SELECT state FROM publish_attempts WHERE draft_id=? ORDER BY attempt_no DESC LIMIT 1", (draft_id,)
+    ).fetchone()
+    if previous and previous["state"] in {"started", "unknown", "succeeded"}:
+        blockers.append("Есть незавершённая или успешная попытка. Проверьте канал и выполните publish-resolve.")
+    return list(dict.fromkeys(blockers))
 
 
 def _valid_max_post_url(url: str) -> bool:
@@ -42,87 +103,128 @@ def _extract_channel_post(result: object) -> tuple[str, str]:
     if not isinstance(message, dict):
         raise ValueError("В ответе MAX отсутствует объект созданного сообщения")
     body = message.get("body")
-    if not isinstance(body, dict) or not body.get("mid"):
+    if not isinstance(body, dict) or not isinstance(body.get("mid"), str) or not body["mid"].strip():
         raise ValueError("В ответе MAX отсутствует ID созданного сообщения (message.body.mid)")
     message_url = message.get("url")
     if not isinstance(message_url, str) or not _valid_max_post_url(message_url):
         raise ValueError("В ответе MAX отсутствует действительная публичная HTTPS-ссылка на пост")
-    return message_url, str(body["mid"])
+    return message_url, body["mid"]
 
 
 def publish(db: sqlite3.Connection, draft_id: int, dry_run: bool = False,
-            now: datetime | None = None) -> dict[str, str]:
-    draft = get_draft(db, draft_id)
-    if draft["status"] != "approved":
-        raise ValueError("Публиковать можно только черновик со статусом approved")
-    _assert_selected_batch_part(db, draft, now)
-    token, channel_id = get_max_credentials()
-    if not dry_run and (not token or not channel_id):
-        raise RuntimeError(
-            "Для публикации настройте MAX credentials командой "
-            "python -m app credentials set-max либо задайте MAX_BOT_TOKEN и MAX_CHANNEL_ID"
-        )
+            now: datetime | None = None, *,
+            expected_revision: int | None = None) -> dict[str, str]:
+    # Freeze the version at invocation even for CLI callers without an explicit
+    # browser confirmation. Credential storage may involve slow external I/O.
+    if expected_revision is None:
+        expected_revision = int(get_draft(db, draft_id)["revision"])
+    blockers = publish_preflight(db, draft_id, now=now, expected_revision=expected_revision)
+    if blockers:
+        raise ValueError("; ".join(blockers))
+    # Preview has the same editorial/slot checks and never opens credential
+    # storage or contacts MAX. A read transaction gives it a consistent view.
     if dry_run:
-        _assert_daily_slot_available(db, draft, now=now)
-        return {"status": "dry_run", "text": draft["body"]}
-    # BEGIN IMMEDIATE serializes competing manual/scheduled publishers. The
-    # started attempt is the daily-slot reservation until success or resolution.
+        db.execute("BEGIN")
+        try:
+            blockers = publish_preflight(db, draft_id, now=now, expected_revision=expected_revision)
+            if blockers:
+                raise ValueError("; ".join(blockers))
+            return {"status": "dry_run", "text": get_draft(db, draft_id)["body"]}
+        finally:
+            db.rollback()
+    token, channel_id = get_max_credentials()
+    if not token or not channel_id:
+        raise RuntimeError("Настройте MAX credentials командой python -m app credentials set-max")
+    # Recheck every invariant while reserving the attempt, after credential I/O.
     db.execute("BEGIN IMMEDIATE")
     try:
+        blockers = publish_preflight(db, draft_id, now=now, expected_revision=expected_revision)
+        if blockers:
+            raise ValueError("; ".join(blockers))
         draft = get_draft(db, draft_id)
-        if draft["status"] != "approved":
-            raise ValueError("Публиковать можно только черновик со статусом approved")
-        _assert_selected_batch_part(db, draft, now)
-        previous = db.execute("SELECT * FROM publish_attempts WHERE draft_id=? ORDER BY attempt_no DESC LIMIT 1",
-                              (draft_id,)).fetchone()
-        if previous and previous["state"] in {"started", "unknown", "succeeded"}:
-            raise ValueError("Для этого черновика уже есть незавершённая или успешная попытка. Сначала проверьте канал и выполните publish-resolve.")
-        _assert_daily_slot_available(db, draft, now=now)
-        attempt_no = (previous["attempt_no"] + 1) if previous else 1
-        started_at = now_iso()
-        db.execute("INSERT INTO publish_attempts(draft_id,attempt_no,state,created_at) VALUES(?,?,'started',?)",
-                   (draft_id, attempt_no, started_at))
+        previous = db.execute(
+            "SELECT attempt_no FROM publish_attempts WHERE draft_id=? ORDER BY attempt_no DESC LIMIT 1", (draft_id,)
+        ).fetchone()
+        attempt_no = previous["attempt_no"] + 1 if previous else 1
+        lease_expires = (datetime.now(timezone.utc) + PUBLISH_LEASE).isoformat(timespec="seconds")
+        started_at = (now.isoformat(timespec="seconds") if now else now_iso())
+        attempt_id = int(db.execute(
+            """INSERT INTO publish_attempts(draft_id,attempt_no,state,created_at,lease_expires_at,
+                   owner_pid,draft_revision,body_hash) VALUES(?,?,'started',?,?,?,?,?)""",
+            (draft_id, attempt_no, started_at, lease_expires, os.getpid(), draft["revision"],
+             approval_fingerprint(db, draft)),
+        ).lastrowid)
+        _audit(db, "publish_started", "draft", draft_id,
+               {"attempt_no": attempt_no, "revision": draft["revision"], "lease_expires_at": lease_expires})
         db.commit()
     except Exception:
         db.rollback()
         raise
-    query = urllib.parse.urlencode({"chat_id": channel_id})
-    request = urllib.request.Request(
-        f"{API_URL}?{query}",
-        data=json.dumps({"text": draft["body"], "format": "markdown", "notify": True},
-                        ensure_ascii=False).encode("utf-8"),
-        headers={"Authorization": token, "Content-Type": "application/json"},
-        method="POST",
-    )
     try:
+        request = urllib.request.Request(
+            f"{API_URL}?{urllib.parse.urlencode({'chat_id': channel_id})}",
+            data=json.dumps({"text": draft["body"], "format": "markdown", "notify": True},
+                            ensure_ascii=False).encode("utf-8"),
+            headers={"Authorization": token, "Content-Type": "application/json"}, method="POST",
+        )
         with urllib.request.urlopen(request, timeout=30) as response:
+            if not 200 <= getattr(response, "status", 200) < 300:
+                raise ValueError("MAX вернул неожиданный HTTP status")
             result = json.loads(response.read().decode("utf-8"))
             message_url, api_message_id = _extract_channel_post(result)
     except urllib.error.HTTPError as exc:
-        detail = exc.read(2000).decode("utf-8", errors="replace")
-        state = "failed" if 400 <= exc.code < 500 else "unknown"
-        db.execute("UPDATE publish_attempts SET state=?,details=? WHERE draft_id=? AND attempt_no=?",
-                   (state, f"HTTP {exc.code}: {detail}", draft_id, attempt_no))
-        db.commit()
-        record_event(db, "publish_error", "draft", draft_id,
-                     {"http_status": exc.code, "detail": detail})
-        raise RuntimeError(f"MAX API вернул HTTP {exc.code}: {detail}") from exc
+        detail = _redact(exc.read(8192).decode("utf-8", errors="replace"), token)
+        state = "failed" if 400 <= exc.code < 500 and exc.code != 408 else "unknown"
+        _finish_failed_attempt(db, draft_id, attempt_id, state, f"HTTP {exc.code}: {detail}")
+        raise RuntimeError(f"MAX API вернул HTTP {exc.code}: {detail}") from None
     except Exception as exc:
-        db.execute("UPDATE publish_attempts SET state='unknown',details=? WHERE draft_id=? AND attempt_no=?",
-                   (f"{type(exc).__name__}: {exc}", draft_id, attempt_no))
+        detail = _redact(f"{type(exc).__name__}: {exc}", token)
+        _finish_failed_attempt(db, draft_id, attempt_id, "unknown", detail)
+        raise RuntimeError(
+            "Не удалось достоверно узнать результат отправки. Проверьте канал и выполните publish-resolve; "
+            "не отправляйте повторно вслепую."
+        ) from None
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        changed = db.execute(
+            "UPDATE publish_attempts SET state='succeeded',details=?,message_id=? WHERE id=? AND state='started'",
+            (message_url, api_message_id, attempt_id),
+        ).rowcount
+        if changed != 1:
+            raise RuntimeError("Состояние попытки изменилось во время отправки; требуется сверка канала")
+        published_at = now_iso()
+        db.execute(
+            """UPDATE drafts SET status='published',published_at=?,updated_at=?,max_post_url=?,max_message_id=?
+               WHERE id=?""", (published_at, published_at, message_url, api_message_id, draft_id),
+        )
+        _audit(db, "draft_published", "draft", draft_id,
+               {"max_post_url": message_url, "api_message_id": api_message_id,
+                "attempt_no": attempt_no, "revision": draft["revision"]})
         db.commit()
-        record_event(db, "publish_outcome_unknown", "draft", draft_id,
-                     {"attempt_no": attempt_no, "error": f"{type(exc).__name__}: {exc}"})
-        raise RuntimeError("Не удалось достоверно узнать результат отправки. Проверьте канал и выполните publish-resolve; не отправляйте повторно вслепую.") from exc
-    published_at = now_iso()
-    db.execute("UPDATE drafts SET status='published',published_at=?,updated_at=?,max_post_url=? WHERE id=?",
-               (published_at, published_at, message_url, draft_id))
-    db.execute("UPDATE publish_attempts SET state='succeeded',details=? WHERE draft_id=? AND attempt_no=?",
-               (message_url, draft_id, attempt_no))
-    db.commit()
-    record_event(db, "draft_published", "draft", draft_id,
-                 {"max_post_url": message_url, "api_message_id": api_message_id})
-    return {"status": "published", "url": message_url}
+    except Exception:
+        db.rollback()
+        # The durable started attempt remains reserved if local persistence
+        # fails after MAX accepted the message. Recovery must inspect the channel.
+        raise
+    return {"status": "published", "url": message_url, "message_id": api_message_id}
+
+
+def _finish_failed_attempt(db: sqlite3.Connection, draft_id: int, attempt_id: int,
+                           state: str, detail: str) -> None:
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        changed = db.execute(
+            "UPDATE publish_attempts SET state=?,details=? WHERE id=? AND state='started'",
+            (state, detail, attempt_id),
+        ).rowcount
+        if changed != 1:
+            raise RuntimeError("Состояние попытки изменилось; проверьте журнал и канал")
+        _audit(db, "publish_error" if state == "failed" else "publish_outcome_unknown", "draft", draft_id,
+               {"attempt_id": attempt_id, "state": state, "error": detail})
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
 
 
 def _assert_selected_batch_part(db: sqlite3.Connection, draft: sqlite3.Row,
@@ -164,14 +266,16 @@ def _assert_daily_slot_available(db: sqlite3.Connection, draft: sqlite3.Row,
             f"(черновик #{published['id']}); дневной лимит — один пост."
         )
     active = db.execute(
-        """SELECT d.id,a.state FROM publish_attempts a JOIN drafts d ON d.id=a.draft_id
-           WHERE d.correction_of_id IS NULL AND d.id<>? AND a.state IN ('started','unknown','succeeded')
-             AND a.created_at>=? AND a.created_at<? ORDER BY a.created_at LIMIT 1""",
+        """SELECT d.id,a.state,a.created_at FROM publish_attempts a JOIN drafts d ON d.id=a.draft_id
+           WHERE d.correction_of_id IS NULL AND d.id<>?
+             AND (a.state IN ('started','unknown') OR
+                  (a.state='succeeded' AND a.created_at>=? AND a.created_at<?))
+           ORDER BY a.created_at LIMIT 1""",
         (draft["id"], start_utc, end_utc),
     ).fetchone()
     if active:
         raise ValueError(
-            f"Уже есть попытка публикации основного поста #{active['id']} за {local_date.isoformat()} "
+            f"Уже есть попытка публикации основного поста #{active['id']} от {active['created_at']} "
             f"со статусом {active['state']}; проверьте её результат перед другой отправкой."
         )
 
@@ -188,48 +292,7 @@ def _day_bounds_utc(now: datetime | None = None) -> tuple[str, str, date]:
 
 
 def _approval_checks_complete(db: sqlite3.Connection, draft: sqlite3.Row) -> bool:
-    if db.execute(
-        "SELECT 1 FROM revision_alerts WHERE draft_id=? AND resolution IS NULL LIMIT 1",
-        (draft["id"],),
-    ).fetchone():
-        return False
-    event = db.execute(
-        """SELECT details FROM events WHERE kind='draft_approved' AND entity_type='draft' AND entity_id=?
-           ORDER BY id DESC LIMIT 1""", (str(draft["id"]),)
-    ).fetchone()
-    if event is None:
-        return False
-    try:
-        details = json.loads(event["details"] or "{}")
-        checks = details.get("editor_checks", {})
-    except (AttributeError, TypeError, json.JSONDecodeError):
-        return False
-    required = ["evidence_checked", "independence_checked"]
-    if draft["requires_group_review"]:
-        required.append("groups_checked")
-    if not all(checks.get(key) is True for key in required):
-        return False
-    claims = list(db.execute(
-        "SELECT * FROM draft_claims WHERE draft_id=? AND included=1", (draft["id"],)
-    ))
-    if not claims or any(
-        not all(claim[key] for key in ("claim_text", "source_id", "source_name", "published_at", "source_url"))
-        or claim["event_date_status"] not in {"explicit", "same_day"}
-        or not claim["event_date"] or not claim["event_date_reviewed_at"]
-        or not claim_link_check_is_current(claim)
-        for claim in claims
-    ):
-        return False
-    unchecked_groups = db.execute(
-        """SELECT COUNT(*) FROM (
-             SELECT g.id FROM draft_groups g JOIN draft_claims c ON c.group_id=g.id
-             WHERE g.draft_id=? GROUP BY g.id
-             HAVING SUM(CASE WHEN c.included=1 THEN 1 ELSE 0 END)>1
-               AND (g.reviewed_at IS NULL OR g.review_note='' OR g.review_same_event IS NULL
-                    OR g.sources_independent IS NULL)
-           )""", (draft["id"],)
-    ).fetchone()[0]
-    return unchecked_groups == 0
+    return not approval_blockers(db, int(draft["id"]))
 
 
 def publish_scheduled(db: sqlite3.Connection, dry_run: bool = False,
@@ -309,23 +372,67 @@ def publish_scheduled(db: sqlite3.Connection, dry_run: bool = False,
     return {**publish(db, draft_id, now=current), "draft_id": str(draft_id)}
 
 
-def resolve_attempt(db: sqlite3.Connection, draft_id: int, posted: bool, url: str = "") -> None:
-    attempt = db.execute("SELECT * FROM publish_attempts WHERE draft_id=? ORDER BY attempt_no DESC LIMIT 1",
-                         (draft_id,)).fetchone()
-    if attempt is None or attempt["state"] not in {"started", "unknown"}:
-        raise ValueError("Для черновика нет неопределённой попытки публикации")
-    if posted:
-        if not _valid_max_post_url(url):
-            raise ValueError("Для разрешения как опубликованного укажите действительную ссылку на пост HTTPS на max.ru")
-        published_at = now_iso()
-        db.execute("UPDATE drafts SET status='published',published_at=?,updated_at=?,max_post_url=? WHERE id=?",
-                   (published_at, published_at, url, draft_id))
-        db.execute("UPDATE publish_attempts SET state='succeeded',details=? WHERE id=?", (url, attempt["id"]))
-        record_event(db, "publish_resolved_as_posted", "draft", draft_id, {"url": url})
-    else:
-        if url.strip():
-            raise ValueError("--url применим только вместе с --posted")
-        db.execute("UPDATE publish_attempts SET state='failed',details='Редактор проверил канал: публикации нет' WHERE id=?",
-                   (attempt["id"],))
-        record_event(db, "publish_resolved_as_not_posted", "draft", draft_id)
-    db.commit()
+def resolve_attempt(db: sqlite3.Connection, draft_id: int, posted: bool, url: str = "",
+                    *, message_id: str = "", published_at: str | None = None,
+                    now: datetime | None = None) -> None:
+    """Reconcile unknown/dead attempts only after an explicit channel check.
+
+    A live started owner cannot be released even after its lease expires. A dead
+    owner must also outlive the lease. Legacy attempts use created_at + 5 minutes.
+    """
+    current = now or datetime.now(timezone.utc)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        attempt = db.execute(
+            "SELECT * FROM publish_attempts WHERE draft_id=? ORDER BY attempt_no DESC LIMIT 1", (draft_id,)
+        ).fetchone()
+        if attempt is None or attempt["state"] not in {"started", "unknown"}:
+            raise ValueError("Для черновика нет неопределённой попытки публикации")
+        if attempt["state"] == "started":
+            try:
+                expires = (datetime.fromisoformat(attempt["lease_expires_at"]) if attempt["lease_expires_at"]
+                           else datetime.fromisoformat(attempt["created_at"]) + PUBLISH_LEASE)
+                if expires.tzinfo is None:
+                    expires = expires.replace(tzinfo=timezone.utc)
+            except (TypeError, ValueError):
+                raise ValueError("У попытки повреждено время lease; требуется ручная диагностика базы") from None
+            if _process_alive(attempt["owner_pid"]):
+                raise ValueError("Отправляющий процесс ещё работает. Дождитесь его завершения; живую started попытку освобождать нельзя.")
+            if current < expires:
+                raise ValueError(f"Резерв попытки действует до {expires.isoformat()}. Дождитесь истечения lease, затем проверьте канал.")
+        if posted:
+            if not _valid_max_post_url(url):
+                raise ValueError("Для разрешения как опубликованного укажите действительную ссылку на пост HTTPS на max.ru")
+            # Keep the date of the original send when reconciliation happens on
+            # another day; an operator may supply the verified actual timestamp.
+            timestamp = published_at or attempt["created_at"]
+            try:
+                observed = datetime.fromisoformat(timestamp)
+                if observed.tzinfo is None:
+                    observed = observed.replace(tzinfo=timezone.utc)
+                if observed > current:
+                    raise ValueError("Время публикации не может быть в будущем")
+            except (TypeError, ValueError):
+                raise ValueError("Укажите действительное время публикации ISO-8601, не позже текущего") from None
+            timestamp = observed.astimezone(timezone.utc).isoformat(timespec="seconds")
+            db.execute(
+                """UPDATE drafts SET status='published',published_at=?,updated_at=?,max_post_url=?,max_message_id=?
+                   WHERE id=?""", (timestamp, now_iso(), url, message_id, draft_id),
+            )
+            db.execute("UPDATE publish_attempts SET state='succeeded',details=?,message_id=? WHERE id=?",
+                       (url, message_id, attempt["id"]))
+            _audit(db, "publish_resolved_as_posted", "draft", draft_id,
+                   {"url": url, "message_id": message_id, "published_at": timestamp,
+                    "timestamp_basis": "editor" if published_at else "attempt_created_at"})
+        else:
+            if url.strip() or message_id.strip() or published_at:
+                raise ValueError("Ссылка, message_id и время применимы только вместе с --posted")
+            db.execute("UPDATE publish_attempts SET state='failed',details='Редактор проверил канал: публикации нет' WHERE id=?",
+                       (attempt["id"],))
+            _audit(db, "publish_resolved_as_not_posted", "draft", draft_id)
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise

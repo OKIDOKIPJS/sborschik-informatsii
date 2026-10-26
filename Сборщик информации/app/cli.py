@@ -6,9 +6,10 @@ import getpass
 import json
 import sys
 import webbrowser
+from pathlib import Path
 from datetime import datetime, timedelta, timezone
 
-from .config import APP_DIR, get_source, load_sources, sources_path
+from .config import APP_DIR, get_source, load_sources, sources_path, runtime_data_dir
 from .credentials import get_max_credentials, remove_max_credentials, save_max_credentials
 from .corrections import create_correction_draft, mark_correction_evidence_checked
 from .db import connect
@@ -32,6 +33,25 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="Сборщик информации", description="Сбор материалов и редакторская очередь для MAX")
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("init", help="создать базу и проверить путь к sources.yaml")
+    doctor = commands.add_parser("doctor", help="диагностика без сетевых запросов и изменения базы")
+    doctor.add_argument("--json", action="store_true", help="машиночитаемый отчёт без секретов")
+    web = commands.add_parser("web", help="локальный кабинет редактора")
+    web.add_argument("--host", choices=["127.0.0.1", "localhost"], default="127.0.0.1")
+    web.add_argument("--port", type=int, default=8765)
+    web.add_argument("--open", action="store_true", help="открыть редактор в браузере")
+    backup = commands.add_parser("backup", help="согласованная копия и восстановление SQLite")
+    backup_commands = backup.add_subparsers(dest="backup_command", required=True)
+    backup_create = backup_commands.add_parser("create", help="создать копию с манифестом и SHA-256")
+    backup_create.add_argument("--output", type=Path)
+    backup_verify = backup_commands.add_parser("verify", help="проверить копию и манифест")
+    backup_verify.add_argument("path", type=Path)
+    backup_restore = backup_commands.add_parser("restore", help="восстановить в новый файл без перезаписи рабочей базы")
+    backup_restore.add_argument("path", type=Path)
+    backup_restore.add_argument("--to", required=True, type=Path)
+    export = commands.add_parser("export", help="сохранить сводку и основания в файл")
+    export.add_argument("id", type=int)
+    export.add_argument("--format", choices=["json", "html", "txt"], default="html")
+    export.add_argument("--output", required=True, type=Path)
     schedule = commands.add_parser("schedule", help="управление ежедневными задачами Планировщика Windows")
     schedule_commands = schedule.add_subparsers(dest="schedule_command", required=True)
     schedule_commands.add_parser("install", help="зарегистрировать сбор на 12:00 и публикацию на 14:00 МСК")
@@ -151,7 +171,11 @@ def build_parser() -> argparse.ArgumentParser:
     group_check.add_argument("--note", required=True, help="краткое основание решения редактора")
     edit = review_commands.add_parser("edit", help="исправить pending-черновик")
     edit.add_argument("id", type=int)
-    edit.add_argument("--text", required=True)
+    edit_input = edit.add_mutually_exclusive_group(required=True)
+    edit_input.add_argument("--text")
+    edit_input.add_argument("--text-file", type=Path, help="UTF-8 файл с текстом поста")
+    reopen = review_commands.add_parser("reopen", help="снять одобрение и вернуть на проверку")
+    reopen.add_argument("id", type=int)
     for decision in ("approve", "reject"):
         sub = review_commands.add_parser(decision)
         sub.add_argument("id", type=int)
@@ -233,6 +257,31 @@ def main(argv: list[str] | None = None) -> int:
     db = None
     try:
         config = None
+        if args.command == "doctor":
+            from .diagnostics import run_doctor
+            report = run_doctor()
+            if args.json:
+                print(json.dumps(report, ensure_ascii=False, indent=2))
+            else:
+                for check in report["checks"]:
+                    print(f"[{check['status']}] {check['name']}: {check['detail']}")
+            return 1 if report["status"] == "error" else 0
+        if args.command == "backup":
+            from .backup import create_backup, restore_backup, verify_backup
+            if args.backup_command == "create":
+                result = create_backup(runtime_data_dir() / "app.sqlite3", args.output)
+            elif args.backup_command == "verify":
+                result = verify_backup(args.path)
+            else:
+                result = restore_backup(args.path, args.to)
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+            return 0
+        if args.command == "web":
+            from .web import serve
+            if not 0 <= args.port <= 65535:
+                raise ValueError("Порт должен быть от 0 до 65535")
+            serve(args.host, args.port, args.open)
+            return 0
         if args.command not in {"schedule", "credentials"}:
             config = load_sources()
             db = connect()
@@ -486,8 +535,13 @@ def main(argv: list[str] | None = None) -> int:
                 review_candidate_group(db, args.id, args.group_no, args.same_event, args.independent, args.note)
                 print(f"Проверка группы-кандидата #{args.group_no} в черновике #{args.id} записана.")
             elif args.review_command == "edit":
-                edit_draft(db, args.id, args.text)
+                text = args.text_file.read_text(encoding="utf-8-sig") if args.text_file else args.text
+                edit_draft(db, args.id, text)
                 print(f"Черновик #{args.id} исправлен; изменение записано в журнал.")
+            elif args.review_command == "reopen":
+                from .review_queue import reopen_draft
+                reopen_draft(db, args.id)
+                print(f"Черновик #{args.id} возвращён на проверку.")
             else:
                 decision = "approved" if args.review_command == "approve" else "rejected"
                 checks = None
@@ -522,6 +576,13 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "logs":
             for row in recent_events(db, max(1, min(args.limit, 500))):
                 print(f"{row['created_at']} {row['kind']} {row['entity_type']}:{row['entity_id']} {row['details']}")
+        elif args.command == "export":
+            from .web_service import export_draft
+            body, _kind, _name = export_draft(db, args.id, args.format)
+            args.output.parent.mkdir(parents=True, exist_ok=True)
+            with args.output.open("xb") as stream:
+                stream.write(body)
+            print(f"Экспорт сохранён: {args.output.resolve()}")
         return 0
     except Exception as exc:
         if db is not None:

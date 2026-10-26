@@ -67,9 +67,11 @@ def normalize_item(raw: dict[str, Any]) -> dict[str, Any]:
     published_at = normalize_datetime(raw.get("published_at"))
     fetched_at = normalize_datetime(raw.get("fetched_at") or datetime.now(timezone.utc))
     fingerprint_text = re.sub(r"\W+", " ", f"{title} {summary}".casefold()).strip()
-    # Keep identical reports from different publishers as separate evidence
-    # records so the draft can attach more than one source to an event.
-    hash_input = f"{raw.get('source_id', '')}\n{fingerprint_text}"
+    # A publisher may reuse the same headline and summary for different dated
+    # reports. Include publication identity so the legacy UNIQUE(source_id,
+    # content_hash) constraint does not collapse those distinct URLs. Existing
+    # publications remain addressable by their canonical source_id + URL.
+    hash_input = f"{raw.get('source_id', '')}\n{url}\n{fingerprint_text}"
     content_hash = hashlib.sha256(hash_input.encode("utf-8")).hexdigest()
     return {**raw, "title": title, "summary": summary, "url": url,
             "published_at": published_at, "fetched_at": fetched_at,
