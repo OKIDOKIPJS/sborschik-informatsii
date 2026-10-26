@@ -500,7 +500,7 @@ class CollectorAndReviewTests(unittest.TestCase):
         item_id, version_id = insert_test_item(
             db, "test", source_url, published_at.isoformat(), created_at.isoformat(), source_id,
         )
-        published_label = published_at.astimezone(MOSCOW).strftime("%d.%m.%Y, %H:%M МСК")
+        published_label = published_at.astimezone(MOSCOW).strftime("%d.%m.%Y, %H:%M") + " МСК"
         text = ("• **ЗАЯВЛЕНИЕ ИСТОЧНИКА** — Test source сообщает: test.\n"
                 f"— Test source, опубликовано {published_label}; ссылка отвечает HTTP 200: {source_url}")
         cursor = db.execute(

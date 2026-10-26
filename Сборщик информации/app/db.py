@@ -7,6 +7,23 @@ from typing import Any
 
 from .config import DB_PATH
 
+SCHEMA_VERSION = 2
+WORKFLOW_COLUMNS = {
+    "drafts": {
+        "revision": "INTEGER NOT NULL DEFAULT 1",
+        "approved_revision": "INTEGER",
+        "approved_hash": "TEXT NOT NULL DEFAULT ''",
+        "max_message_id": "TEXT NOT NULL DEFAULT ''",
+    },
+    "publish_attempts": {
+        "lease_expires_at": "TEXT",
+        "message_id": "TEXT NOT NULL DEFAULT ''",
+        "draft_revision": "INTEGER",
+        "body_hash": "TEXT NOT NULL DEFAULT ''",
+        "owner_pid": "INTEGER",
+    },
+}
+
 SCHEMA = """
 PRAGMA foreign_keys = ON;
 CREATE TABLE IF NOT EXISTS raw_items (
@@ -90,7 +107,11 @@ CREATE TABLE IF NOT EXISTS drafts (
     correction_publication_check_status TEXT NOT NULL DEFAULT '',
     correction_publication_checked_at TEXT,
     correction_link_checked_at TEXT,
-    correction_link_check_note TEXT NOT NULL DEFAULT ''
+    correction_link_check_note TEXT NOT NULL DEFAULT '',
+    revision INTEGER NOT NULL DEFAULT 1,
+    approved_revision INTEGER,
+    approved_hash TEXT NOT NULL DEFAULT '',
+    max_message_id TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS digest_batches (
     id TEXT PRIMARY KEY,
@@ -178,17 +199,47 @@ CREATE TABLE IF NOT EXISTS publish_attempts (
     state TEXT NOT NULL CHECK(state IN ('started','succeeded','failed','unknown')),
     created_at TEXT NOT NULL,
     details TEXT NOT NULL DEFAULT '',
+    lease_expires_at TEXT,
+    message_id TEXT NOT NULL DEFAULT '',
+    draft_revision INTEGER,
+    body_hash TEXT NOT NULL DEFAULT '',
+    owner_pid INTEGER,
     UNIQUE(draft_id, attempt_no)
 );
 """
 
 
 def connect(path: Path | None = None) -> sqlite3.Connection:
-    db_file = path or DB_PATH
+    """Open the current schema, snapshotting existing databases before upgrade.
+
+    Versioned databases skip all legacy data backfills and migrations on normal
+    CLI/UI requests. A newer schema is never silently downgraded.
+    """
+    db_file = Path(path or DB_PATH).expanduser().resolve()
+    existing_database = db_file.is_file() and db_file.stat().st_size > 0
     db_file.parent.mkdir(parents=True, exist_ok=True)
     connection = sqlite3.connect(db_file)
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA foreign_keys = ON")
+    try:
+        version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+        if version > SCHEMA_VERSION:
+            raise ValueError("База создана более новой версией приложения; обновите приложение")
+        if version == SCHEMA_VERSION:
+            return connection
+        if existing_database:
+            from .backup import backup_before_change
+            backup_before_change(db_file, f"schema_migration_{version}_to_{SCHEMA_VERSION}")
+        _migrate_connection(connection)
+        connection.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+        connection.commit()
+        return connection
+    except BaseException:
+        connection.close()
+        raise
+
+
+def _migrate_connection(connection: sqlite3.Connection) -> None:
     connection.executescript(SCHEMA)
     # Older databases may already contain repeated RSS observations. Keep the
     # earliest row ID (so existing references remain valid), move item links to
@@ -395,8 +446,49 @@ def connect(path: Path | None = None) -> sqlite3.Connection:
                    SELECT id,?,?,updated_at FROM drafts WHERE id=?""",
                 (batch_id, part_no, part_draft_id),
             )
-    connection.commit()
-    return connection
+    # Additive workflow migration: old approvals deliberately have no snapshot
+    # and must be reopened/reviewed before sending.
+    for table, definitions in WORKFLOW_COLUMNS.items():
+        existing = {row[1] for row in connection.execute(f"PRAGMA table_info({table})")}
+        for column, definition in definitions.items():
+            if column not in existing:
+                connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+    _install_workflow_guards(connection)
+
+
+def _install_workflow_guards(db: sqlite3.Connection) -> None:
+    """Keep revisions valid even for legacy collector/mutation entry points."""
+    editable = (
+        "title", "body", "requires_group_review", "correction_reason", "correction_text",
+        "correction_source_id", "correction_source_url", "correction_original_url",
+        "correction_publication_check_status", "correction_publication_checked_at",
+        "correction_link_checked_at", "correction_link_check_note",
+    )
+    columns = ",".join(editable)
+    changed = " OR ".join(f"OLD.{name} IS NOT NEW.{name}" for name in editable)
+    db.execute(f"""CREATE TRIGGER IF NOT EXISTS workflow_draft_pending
+        BEFORE UPDATE OF {columns} ON drafts
+        WHEN ({changed}) AND (OLD.status<>'pending' OR EXISTS(
+            SELECT 1 FROM publish_attempts WHERE draft_id=OLD.id AND state IN ('started','unknown')))
+        BEGIN SELECT RAISE(ABORT, 'Draft must be pending with no active publication before editing'); END""")
+    db.execute(f"""CREATE TRIGGER IF NOT EXISTS workflow_draft_revision
+        AFTER UPDATE OF {columns} ON drafts WHEN {changed}
+        BEGIN UPDATE drafts SET revision=revision+1,approved_revision=NULL,approved_hash=''
+              WHERE id=NEW.id; END""")
+    for table in ("draft_claims", "draft_groups", "revision_alerts"):
+        for operation in ("INSERT", "UPDATE", "DELETE"):
+            row = "OLD" if operation == "DELETE" else "NEW"
+            if table != "revision_alerts":
+                db.execute(f"""CREATE TRIGGER IF NOT EXISTS workflow_{table}_{operation.lower()}_pending
+                    BEFORE {operation} ON {table}
+                    WHEN (SELECT status FROM drafts WHERE id={row}.draft_id)<>'pending' OR EXISTS(
+                        SELECT 1 FROM publish_attempts WHERE draft_id={row}.draft_id AND state IN ('started','unknown'))
+                    BEGIN SELECT RAISE(ABORT, 'Draft must be pending before reviewing evidence'); END""")
+            db.execute(f"""CREATE TRIGGER IF NOT EXISTS workflow_{table}_{operation.lower()}_revision
+                AFTER {operation} ON {table}
+                BEGIN UPDATE drafts SET revision=revision+1,approved_revision=NULL,approved_hash='',
+                    status=CASE WHEN status='approved' THEN 'pending' ELSE status END
+                    WHERE id={row}.draft_id; END""")
 
 
 def row_dict(row: sqlite3.Row | None) -> dict[str, Any] | None:
