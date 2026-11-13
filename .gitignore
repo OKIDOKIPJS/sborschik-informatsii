@@ -21,3 +21,10 @@ venv/
 *.sqlite3
 *.db
 *.log
+
+# Build artifacts and exported local material
+**/dist/
+**/build/
+*.egg-info/
+**/exports/
+**/backups/

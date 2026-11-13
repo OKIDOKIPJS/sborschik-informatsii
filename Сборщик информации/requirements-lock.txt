@@ -1,0 +1,2 @@
+# Tested offline editor runtime on Python 3.11/3.12; optional model is separate.
+PyYAML==6.0.3

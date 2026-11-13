@@ -12,8 +12,8 @@ from typing import Any
 
 from .deduplicator import insert_normalized
 from .logs import now_iso, record_event
-from .normalizer import normalize_item
-from .publication_validator import check_publication_link
+from .normalizer import normalize_item, normalize_url
+from .publication_validator import check_publication_link, validate_publication_url
 from .relevance import assess_relevance, store_assessment
 
 USER_AGENT = "SborshchikInformatsii/0.1 (RSS reader; contact: channel owner)"
@@ -25,6 +25,10 @@ def _tag_text(element: ET.Element | None) -> str:
 
 def parse_feed(xml_data: bytes) -> list[dict[str, str | None]]:
     root = ET.fromstring(xml_data)
+    if root.tag not in {"rss", "{http://www.w3.org/2005/Atom}feed"}:
+        raise ValueError("Источник вернул документ, не являющийся RSS 2.0 или Atom")
+    if root.tag == "rss" and root.find("channel") is None:
+        raise ValueError("RSS не содержит обязательный элемент channel")
     items: list[dict[str, str | None]] = []
     # RSS 2.0
     for node in root.findall(".//item"):
@@ -46,7 +50,9 @@ def parse_feed(xml_data: bytes) -> list[dict[str, str | None]]:
                 "published_at": _tag_text(node.find("a:published", ns)) or _tag_text(node.find("a:updated", ns)) or None,
                 "summary": _tag_text(node.find("a:summary", ns)) or _tag_text(node.find("a:content", ns)),
             })
-    return [item for item in items if item.get("title") and item.get("url")]
+    # Keep malformed entries in the result: _store rejects them explicitly and
+    # the collection report must include them in filtered_out/item_rejected.
+    return items
 
 
 def _version_fingerprint(item: dict[str, Any]) -> str:
@@ -119,6 +125,8 @@ def _store(db: sqlite3.Connection, source: dict[str, Any], raw: dict[str, Any], 
         "source_type": source.get("type", "unknown"), "source_level": source.get("level", ""),
         "fetched_at": fetched_at,
     })
+    # A recently cached HEAD result cannot override an updated domain policy.
+    validate_publication_url(source, normalized["url"])
     assessment = assess_relevance(normalized, source)
     if origin == "manual":
         assessment = {"confidence": "high", "status": "included", "matched_terms": [],
@@ -131,9 +139,15 @@ def _store(db: sqlite3.Connection, source: dict[str, Any], raw: dict[str, Any], 
     if cached and cached["origin"] == origin:
         try:
             cached_payload = json.loads(cached["payload"] or "{}")
-            candidate = cached_payload.get("publication_check", {})
+            candidate = cached_payload.get("publication_check", {}) if isinstance(cached_payload, dict) else {}
+            if not isinstance(candidate, dict):
+                candidate = {}
             checked_at = datetime.fromisoformat(candidate.get("checked_at", ""))
-            if datetime.now(timezone.utc) - checked_at.astimezone(timezone.utc) < timedelta(hours=12):
+            if checked_at.tzinfo is None:
+                raise ValueError("У даты проверки ссылки отсутствует часовой пояс")
+            age = datetime.now(timezone.utc) - checked_at.astimezone(timezone.utc)
+            if (timedelta(0) <= age < timedelta(hours=12)
+                    and candidate.get("status") in {"http_ok", "http_ok_feed", "manual_check_required"}):
                 publication_check = candidate
         except (ValueError, TypeError, json.JSONDecodeError):
             publication_check = None
@@ -268,7 +282,7 @@ def _fetch_reliefweb_api(source: dict[str, Any], retrieval: dict[str, Any]) -> l
             countries = [countries]
         country_codes = {str(value.get("iso3", "")).casefold()
                          for value in countries if isinstance(value, dict)}
-        if country_codes and "ukr" not in country_codes:
+        if "ukr" not in country_codes:
             continue
         title = fields.get("title")
         url = fields.get("url")
@@ -327,7 +341,7 @@ def fetch_enabled_sources(db: sqlite3.Connection, sources: list[dict[str, Any]])
                     stored = db.execute(
                         """SELECT a.confidence,a.status FROM relevance_assessments a
                            JOIN items i ON i.id=a.item_id WHERE i.source_id=? AND i.url=?
-                           ORDER BY a.id DESC LIMIT 1""", (source["id"], item["url"]),
+                           ORDER BY a.id DESC LIMIT 1""", (source["id"], normalize_url(str(item["url"]))),
                     ).fetchone()
                     if stored:
                         high_confidence += stored["confidence"] == "high"
@@ -339,17 +353,22 @@ def fetch_enabled_sources(db: sqlite3.Connection, sources: list[dict[str, Any]])
                     skipped += 1
                     record_event(db, "item_rejected", "source", source["id"],
                                  {"url": item.get("url"), "error": str(exc)})
+            status = "partial" if skipped else "ok"
+            if skipped and not (inserted or revised or duplicates):
+                status = "error"
             record_event(db, "source_fetched", "source", source["id"],
                          {"items": len(feed_items), "feed_items": len(feed_items), "inserted": inserted,
                           "revised": revised, "duplicates": duplicates, "filtered_out": skipped,
                           "high_confidence": high_confidence, "medium_confidence": medium_confidence,
                           "low_confidence": low_confidence, "needs_review": needs_review,
-                          "editor_excluded": editor_excluded})
-            results.append({"source": source["id"], "status": "ok", "count": inserted,
+                          "editor_excluded": editor_excluded, "status": status})
+            results.append({"source": source["id"], "status": status, "count": inserted,
                             "revised": revised, "duplicates": duplicates, "filtered_out": skipped,
                             "high_confidence": high_confidence, "medium_confidence": medium_confidence,
                             "low_confidence": low_confidence, "needs_review": needs_review,
                             "editor_excluded": editor_excluded})
+            if status == "error":
+                results[-1]["error"] = "Не удалось обработать ни одну запись источника; подробности в item_rejected"
         except Exception as exc:
             record_event(db, "fetch_error", "source", source["id"], str(exc))
             results.append({"source": source["id"], "status": "error", "error": str(exc), "count": 0})

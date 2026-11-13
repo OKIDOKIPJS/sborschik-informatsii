@@ -78,12 +78,15 @@ def create_correction_draft(db: sqlite3.Connection, original_id: int, reason: st
 
 
 def mark_correction_evidence_checked(db: sqlite3.Connection, draft_id: int,
-                                     note: str, evidence: str) -> dict[str, str]:
-    draft = db.execute("SELECT * FROM drafts WHERE id=?", (draft_id,)).fetchone()
-    if draft is None or draft["correction_of_id"] is None:
+                                     note: str, evidence: str, *,
+                                     expected_revision: int | None = None) -> dict[str, str]:
+    # Import lazily: review_queue also uses correction_evidence_is_current.
+    from .review_queue import _assert_editable, _audit
+
+    draft = dict(_assert_editable(db, draft_id, expected_revision))
+    if draft["correction_of_id"] is None:
         raise ValueError(f"Черновик #{draft_id} не является исправлением")
-    if draft["status"] != "pending":
-        raise ValueError("Проверить основание исправления можно только в pending-черновике")
+    reviewed_revision = int(draft["revision"])
     if not note.strip() or not evidence.strip():
         raise ValueError("Сохраните пояснение и короткое основание редакторской проверки")
     if not all(draft[key] for key in (
@@ -109,30 +112,44 @@ def mark_correction_evidence_checked(db: sqlite3.Connection, draft_id: int,
             raise ValueError("Старый черновик не содержит полных структурированных данных; создайте исправление заново")
         source = _source_for_url(recovered_source_url)
         _validate_max_post_url(recovered_original_url)
-        db.execute(
-            """UPDATE drafts SET correction_reason=?,correction_text=?,correction_source_id=?,
-               correction_source_url=?,correction_original_url=? WHERE id=?""",
-            (recovered_reason, recovered_text, source["id"], recovered_source_url,
-             recovered_original_url, draft_id),
-        )
-        db.commit()
-        draft = db.execute("SELECT * FROM drafts WHERE id=?", (draft_id,)).fetchone()
+        # Recover in memory first. A failed or stale external check must not
+        # persist a partial legacy migration or attest a different draft body.
+        draft.update(correction_reason=recovered_reason, correction_text=recovered_text,
+                     correction_source_id=source["id"], correction_source_url=recovered_source_url,
+                     correction_original_url=recovered_original_url)
     source = get_source(load_sources(), draft["correction_source_id"])
     validate_publication_url(source, draft["correction_source_url"])
     check = check_publication_link(source, draft["correction_source_url"], origin="manual")
     checked_at = now_iso()
     review_note = f"{note.strip()} Основание редактора: {evidence.strip()}"
-    db.execute(
-        """UPDATE drafts SET correction_publication_check_status=?,correction_publication_checked_at=?,
-           correction_link_checked_at=?,correction_link_check_note=?,updated_at=? WHERE id=?""",
-        (check["status"], check["checked_at"], checked_at, review_note, checked_at, draft_id),
-    )
-    db.commit()
-    record_event(db, "correction_evidence_checked", "draft", draft_id, {
-        "correction_of_id": int(draft["correction_of_id"]),
-        "source_id": draft["correction_source_id"], "source_url": draft["correction_source_url"],
-        "editor_note": review_note, "publication_check": check,
-    })
+    # HEAD may take seconds: another CLI/editor can change, approve, or start
+    # publishing this draft meanwhile. Recheck under the SQLite writer lock.
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        _assert_editable(db, draft_id, reviewed_revision)
+        updated = db.execute(
+            """UPDATE drafts SET correction_reason=?,correction_text=?,correction_source_id=?,
+               correction_source_url=?,correction_original_url=?,
+               correction_publication_check_status=?,correction_publication_checked_at=?,
+               correction_link_checked_at=?,correction_link_check_note=?,updated_at=?
+               WHERE id=? AND status='pending' AND revision=?""",
+            (draft["correction_reason"], draft["correction_text"], draft["correction_source_id"],
+             draft["correction_source_url"], draft["correction_original_url"],
+             check["status"], check["checked_at"], checked_at, review_note, checked_at,
+             draft_id, reviewed_revision),
+        )
+        if updated.rowcount != 1:
+            raise ValueError("Черновик изменился во время проверки основания. Обновите карточку.")
+        _audit(db, "correction_evidence_checked", "draft", draft_id, {
+            "correction_of_id": int(draft["correction_of_id"]),
+            "source_id": draft["correction_source_id"], "source_url": draft["correction_source_url"],
+            "editor_note": review_note, "publication_check": check,
+            "reviewed_revision": reviewed_revision,
+        })
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
     return check
 
 

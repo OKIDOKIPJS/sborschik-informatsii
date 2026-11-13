@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="ru">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Сборщик · Редактор</title><link rel="stylesheet" href="/style.css"><script src="/app.js" defer></script></head>
+<body>
+<aside class="sidebar">
+  <a class="brand" href="#overview"><span class="brand-mark">С</span><span>Сборщик<small>Редакторский кабинет</small></span></a>
+  <div class="nav-label">РАБОЧЕЕ ПРОСТРАНСТВО</div>
+  <nav aria-label="Навигация">
+    <a href="#overview" data-view="overview"><span>◫</span>Обзор</a>
+    <a href="#drafts" data-view="drafts"><span>▤</span>Черновики<i id="nav-count">0</i></a>
+    <a href="#materials" data-view="materials"><span>▱</span>Материалы</a>
+    <a href="#sources" data-view="sources"><span>◎</span>Источники</a>
+    <a href="#events" data-view="events"><span>≡</span>Журнал</a>
+    <a href="#service" data-view="service"><span>⚙</span>Диагностика</a>
+  </nav>
+  <div class="sidebar-bottom"><span class="live-dot"></span>Локально на компьютере<small>Публикация после проверки редактором</small></div>
+</aside>
+<main>
+  <header><div class="breadcrumb">РАБОЧИЙ СТОЛ <span>/</span> <span id="breadcrumb">Обзор</span></div><div class="header-right"><span class="local-label">ЛОКАЛЬНЫЙ РЕЖИМ</span><button id="refresh" class="icon-button" title="Обновить данные" aria-label="Обновить данные">↻</button><div class="avatar" title="Редактор">Р</div></div></header>
+  <section id="content" aria-live="polite"></section>
+  <footer>Сборщик информации <span>•</span> Источники, решения и история версий сохраняются в SQLite</footer>
+</main>
+<div id="toast" role="status" hidden></div>
+<dialog id="dialog"><form id="dialog-form"><div class="dialog-heading"><h2 id="dialog-title"></h2><button type="button" id="dialog-close" class="icon-button" aria-label="Закрыть">×</button></div><div id="dialog-fields"></div><div id="dialog-error" role="alert"></div><div class="dialog-actions"><button type="button" id="dialog-cancel" class="button">Отмена</button><button type="submit" id="dialog-submit" class="button primary">Сохранить решение</button></div></form></dialog>
+</body></html>
